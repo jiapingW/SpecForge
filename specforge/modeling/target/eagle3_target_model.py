@@ -185,6 +185,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         device: str = None,
         cache_dir: Optional[str] = None,
         trust_remote_code: bool = False,
+        quantization: Optional[str] = None,
         **kwargs,
     ) -> "SGLangEagle3TargetModel":
         tp_size = dist.get_world_size(get_tp_group())
@@ -198,6 +199,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             tp_size=tp_size,
             pp_size=1,
             attention_backend="flashinfer",
+            quantization=quantization,
         )
         model_config = ModelConfig.from_server_args(server_args)
         model_runner = SGLangRunner(
@@ -462,6 +464,7 @@ def get_eagle3_target_model(
     torch_dtype: torch.dtype = None,
     device: str = None,
     cache_dir: Optional[str] = None,
+    quantization: Optional[str] = None,
     **kwargs,
 ) -> Eagle3TargetModel:
     if backend == "sglang":
@@ -470,6 +473,7 @@ def get_eagle3_target_model(
             torch_dtype=torch_dtype,
             device=device,
             cache_dir=cache_dir,
+            quantization=quantization,
             **kwargs,
         )
     elif backend == "hf":

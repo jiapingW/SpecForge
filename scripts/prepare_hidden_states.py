@@ -72,6 +72,12 @@ def parse_args():
     parser.add_argument("--num-samples", type=int, default=None)
     parser.add_argument("--enable-aux-hidden-states", action="store_true")
     parser.add_argument("--aux-hidden-states-layers", type=str, default=None)
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        help="The quantization type for SGLang backend (e.g., fp8, awq, gptq, squeezellm).",
+    )
     parser.add_argument("--build-dataset-num-proc", type=int, default=8)
     parser.add_argument(
         "--dist-timeout",
@@ -131,8 +137,8 @@ def build_target_model(
             torch_dtype=torch.bfloat16,
             device="cuda",
             cache_dir=args.cache_dir,
+            quantization=args.quantization,
         )
-
     # Set auxiliary hidden states layers if specified
     target_model.set_aux_hidden_states_layers(args.aux_hidden_states_layers)
 
