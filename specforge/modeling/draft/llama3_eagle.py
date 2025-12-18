@@ -677,7 +677,8 @@ class LlamaAttention(nn.Module):
                 query_states, key_states = apply_rotary_pos_emb(
                     query_states, key_states, cos, sin, position_ids
                 )
-
+            from .forkedpdb import ForkedPdb
+            # ForkedPdb().set_trace()
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
 
@@ -840,6 +841,227 @@ class LlamaFlexAttention(LlamaAttention):
         return attn_output
 
 
+class LlamaLinearAttention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+        self.version = "with_norm_pure" # “with_norm” and "with_norm_pure","default"
+        self.q_proj = nn.Linear(self.hidden_size * 2, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        if self.version!='with_norm_pure':
+            self.u_proj = nn.Linear(self.hidden_size * 2, self.num_heads * self.head_dim, bias=False)
+            self.norm = LlamaRMSNorm(self.hidden_size)
+        # self.slope_rate = torch.tensor([0.0039, 0.0046] * 7).view(14, 1, 1)
+        # self.slope_rate = torch.exp(-self.slope_rate.view(1,self.num_heads,1))
+        self._init_rope()
+        print(f"当前的linear attention版本:{self.version}")
+
+    def _init_rope(self):
+        if self.config.rope_scaling is None:
+            self.rotary_emb = LlamaRotaryEmbedding(
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=getattr(self.config, "rope_theta", 10000),
+            )
+        else:
+            rope_scaling = self.config.rope_scaling
+
+            def rope_get(key, default=None):
+                if isinstance(rope_scaling, dict):
+                    return rope_scaling.get(key, default)
+                return getattr(rope_scaling, key, default)
+
+            scaling_type = rope_get("rope_type", rope_get("type"))
+            scaling_factor = rope_get("factor")
+
+            if scaling_type == "linear":
+                if scaling_factor is None:
+                    raise ValueError(
+                        "Linear RoPE scaling requires 'factor' in rope_scaling config."
+                    )
+                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                )
+            elif scaling_type == "dynamic":
+                if scaling_factor is None:
+                    raise ValueError(
+                        "Dynamic RoPE scaling requires 'factor' in rope_scaling config."
+                    )
+                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                )
+            elif scaling_type == "llama3":
+                # for nv type
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=getattr(self.config, "rope_theta", 10000),
+                    scaling_factor=(
+                        scaling_factor if scaling_factor is not None else 1.0
+                    ),
+                    low_freq_factor=rope_get("low_freq_factor"),
+                    high_freq_factor=rope_get("high_freq_factor"),
+                    orig_max_position=rope_get("original_max_position_embeddings"),
+                )
+            elif scaling_type == "mrope":
+                self.rotary_emb = LlamaMutiRotaryEmbedding(
+                    self.head_dim, max_position_embeddings=self.max_position_embeddings
+                )
+            elif scaling_type == "yarn":
+                self.rotary_emb = LlamaYarnRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    original_max_position_embeddings=rope_get(
+                        "original_max_position_embeddings"
+                    ),
+                    scaling_factor=scaling_factor,
+                    beta_fast=rope_get("beta_fast"),
+                    beta_slow=rope_get("beta_slow"),
+                    mscale=rope_get("mscale"),
+                    mscale_all_dim=rope_get("mscale_all_dim"),
+                )
+            else:
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_hidden: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        # ForkedPdb().set_trace()
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        if self.version!='with_norm_pure':
+            u = self.u_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = F.silu(query_states)
+        key_states = F.silu(key_states)
+        from .forkedpdb import ForkedPdb
+        if cache_hidden is None: # 第一轮处理
+            cos, sin = self.rotary_emb(query_states, seq_len=q_len)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+            key_states = repeat_kv(key_states, self.num_key_value_groups) # 将k和v的head扩展到和q一致
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
+            if self.version=='default':
+                # linear的原版实现
+                attn_output = torch.matmul(torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim) * attention_mask, value_states)
+            elif self.version=='with_norm' or self.version=='with_norm_pure':
+                # linear使用Norm的实现
+                attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+                if attention_mask is not None:
+                    attn_mask = (attention_mask==0).to(query_states)
+                    attn_weights = attn_weights * attention_mask
+                denominator = attn_weights.sum(dim=-1, keepdim=True)
+                numerator = torch.matmul(attn_weights, value_states)
+                attn_output = numerator / (denominator + 1e-6)
+            else:
+                raise Exception('不支持的线性注意力版本')
+        else:
+            lck = len(cache_hidden[0])
+            cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids+lck
+            )
+            key_states = repeat_kv(key_states, self.num_key_value_groups) # 将k和v的head扩展到和q一致
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+            cache_hidden[0] = cache_hidden[0] + [key_states]
+            cache_hidden[1] = cache_hidden[1] + [value_states]
+
+            cache_k = cache_hidden[0]
+            cache_v = cache_hidden[1]
+
+            k0 = cache_k[0]
+            v0 = cache_v[0]
+
+            attn_weights = torch.matmul(query_states, k0.transpose(2, 3)) / math.sqrt(self.head_dim)
+            lck = len(cache_k)
+            attn_mask = (attention_mask==0).to(query_states)
+            attn_weights0 = attn_weights * attn_mask
+            attn_weights0 = attn_weights[..., :q_len] # 拿到q对最开始的token的attention weight
+
+            if self.version=='default':
+                # 下面是标准的linear eagle3
+                attn_output = torch.matmul(attn_weights0, v0)
+                for i in range(1, lck): # 分别计算每个token的attention分数
+                    ki, vi = cache_k[i], cache_v[i]
+                    attn_weightsi = (query_states * ki).sum(-1) / math.sqrt(self.head_dim)
+                    attn_outputi = attn_weightsi[..., None] * vi 
+                    attn_output = attn_output + attn_outputi  # 更新attn_outpdut的输出
+            elif self.version=='with_norm' or self.version=='with_norm_pure':
+                # 下面是带有norm的linear eagle3
+                for i in range(1, lck):
+                    ki = cache_k[i]
+                    qi = query_states
+                    kiq = ki
+                    attn_weightsi = (qi * kiq).sum(-1) / math.sqrt(self.head_dim)
+                    attn_weights = torch.cat(
+                        (attn_weights, attn_weightsi[..., None]), dim=-1
+                    )
+
+                # upcast attention to fp32
+                attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-6)
+                attn_weights = attn_weights.to(query_states.dtype)
+                attn_weights0 = attn_weights[..., :q_len]
+
+                attn_output = torch.matmul(attn_weights0, v0)
+
+                for i in range(1, lck):
+                    vi = cache_v[i]
+                    attn_weightsi = attn_weights[..., q_len + i - 1]
+                    attn_outputi = attn_weightsi[..., None] * vi
+                    attn_output = attn_output + attn_outputi
+
+
+        # 都要走的逻辑，经过gated
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+        if self.version!='with_norm_pure':
+            attn_output = self.norm(attn_output).to(query_states)
+            attn_output = u * attn_output
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output
+
+
+
 class LlamaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -913,6 +1135,10 @@ class LlamaDecoderLayer(nn.Module):
         elif attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
+        elif attention_backend == "linear_attn":
+            print("Using linear attention on draft model training!")
+            self.self_attn = LlamaLinearAttention(config=config)
+
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
@@ -959,6 +1185,8 @@ class LlamaDecoderLayer(nn.Module):
         input_emb = self.input_layernorm(input_emb)
 
         hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
+        from .forkedpdb import ForkedPdb
+        # ForkedPdb().set_trace()
         # Self Attention
         hidden_states = self.self_attn(
             cache_hidden=cache_hidden,

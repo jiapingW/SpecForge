@@ -126,7 +126,7 @@ class OnlineEagle3Model(Eagle3Model):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-        if self.attention_backend == "sdpa":
+        if self.attention_backend == "sdpa" or self.attention_backend == "linear_attn":
             attention_mask = self.draft_model.prepare_decoder_attention_mask(
                 attention_mask=attention_mask,
                 hidden_states=hidden_states,
@@ -139,7 +139,7 @@ class OnlineEagle3Model(Eagle3Model):
         plosses = []
         vlosses = []
         acces = []
-        if self.attention_backend == "sdpa":
+        if self.attention_backend == "sdpa" or self.attention_backend == "linear_attn":
             cache_hidden = [[], []]
             past_key_values = None
         elif self.attention_backend == "flex_attention":
@@ -512,7 +512,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         plosses = []
         vlosses = []
         acces = []
-        if self.attention_backend == "sdpa":
+        if self.attention_backend == "sdpa" or self.attention_backend == "linear_attn":
             cache_hidden = [[], []]
             past_key_values = None
         elif self.attention_backend == "flex_attention":

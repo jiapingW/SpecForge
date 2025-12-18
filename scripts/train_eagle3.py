@@ -679,6 +679,7 @@ def main():
             buffer_dtype=torch.bfloat16,
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+        # sharding_strategy=ShardingStrategy.FULL_SHARD,
         process_group=dist.group.WORLD,  # the draft model should run dp for all processes
     )
     print_with_rank("Initialized Eagle3 FSDP model")
