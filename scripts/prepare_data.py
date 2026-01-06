@@ -1,10 +1,12 @@
 import argparse
 import json
 import os
+import subprocess
+import requests
 from pathlib import Path
 from typing import Dict, Tuple
 
-from datasets import concatenate_datasets, load_dataset
+from datasets import concatenate_datasets, load_dataset, config
 from tqdm import tqdm
 
 """
@@ -84,7 +86,52 @@ def parse_args():
     return parser.parse_args()
 
 
-def process_ultrachat_row(row: Dict) -> Tuple[Dict, int]:
+def _download_file(url: str, dest_path: str) -> None:
+    """Download a file from URL to destination path."""
+    if os.path.exists(dest_path):
+        return
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    resp = requests.get(url)
+    resp.raise_for_status()
+    with open(dest_path, "w") as f:
+        f.write(resp.text)
+
+
+def get_cache_dir(dataset_name):
+    cache_dir = None
+    if dataset_name == "sharegpt4v":
+        raise Exception("Don't Support Download sharegpt4v.")
+    elif dataset_name == "allava4v":
+        cache_dir = os.path.join(config.HF_DATASETS_CACHE, "FreedomIntelligence", "ALLaVA")
+    else:
+        raise Exception(f"Don't support {dataset_name}")
+    return cache_dir
+
+
+def download_vlm_dataset(dataset_name: str) -> None:
+    """Download VLM's dataset such as sharegpt4v and allava4v"""
+    if dataset_name == "sharegpt4v":
+        raise Exception("Don't Support Download sharegpt4v.")
+    elif dataset_name == "allava4v":
+        url = "https://raw.githubusercontent.com/FreedomIntelligence/ALLaVA/main/download/download_laion.sh"
+        cache_dir = get_cache_dir(dataset_name)
+        script_path = os.path.join(cache_dir, "download_laion.sh") 
+        _download_file(url, script_path)
+        os.chmod(script_path, 0o755)
+        if not os.path.exists(os.path.join(cache_dir, "allava_laion")):
+            result = subprocess.run( # 需要去检测为什么unzip执行不正常，通过修改HF_HOME进行实现
+                ["bash", script_path],
+                cwd=cache_dir,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Download image dataset failed: {result.stderr}")
+    else:
+        raise Exception(f"Don't support {dataset_name}")
+
+
+def process_ultrachat_row(row: Dict, dataset_name: str=None) -> Tuple[Dict, int]:
     """Process a row from the ultrachat dataset.
 
     The function expects a row with the following schema:
@@ -106,7 +153,7 @@ def process_ultrachat_row(row: Dict) -> Tuple[Dict, int]:
     return row, 0
 
 
-def process_sharegpt_row(row: Dict) -> Tuple[Dict, int]:
+def process_sharegpt_row(row: Dict, dataset_name: str=None) -> Tuple[Dict, int]:
     """
     sharegpt dataset schema:
     {
@@ -134,7 +181,7 @@ def process_sharegpt_row(row: Dict) -> Tuple[Dict, int]:
     return row, skipped_count
 
 
-def process_sharegpt4v_row(row) -> Dict:
+def process_sharegpt4v_row(row, dataset_name: str=None) -> Dict:
     """
     sharegpt4v dataset schema:
     {
@@ -149,8 +196,9 @@ def process_sharegpt4v_row(row) -> Dict:
         ]
     }
     """
+    cache_dir = get_cache_dir(dataset_name)
     conversations = row["conversations"]
-    image = f'FreedomIntelligence/ALLaVA-4V/{row["image"]}'
+    image = os.path.join(cache_dir, f"{row["image"]}")
     if not os.path.exists(image):
         print(f"Image path {image} does not exist, skipping this sample.")
         return None, None
@@ -189,7 +237,7 @@ def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
     total_skipped_count = 0
     with open(train_output_jsonl_path, "w") as f:
         for item in tqdm(train_ds, desc=f"Processing {dataset_name} dataset"):
-            row, skipped_count = proc_fn(item)
+            row, skipped_count = proc_fn(item, args.dataset_name)
             if row is None:
                 continue
             total_skipped_count += skipped_count
@@ -199,7 +247,7 @@ def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
         test_output_jsonl_path = output_path.joinpath(f"{dataset_name}_test.jsonl")
         with open(test_output_jsonl_path, "w") as f:
             for item in tqdm(test_ds, desc=f"Processing {dataset_name} test dataset"):
-                row, skipped_count = proc_fn(item)
+                row, skipped_count = proc_fn(item, args.dataset_name)
                 if row is None:
                     continue
                 total_skipped_count += skipped_count
@@ -258,11 +306,14 @@ def main():
         proc_fn = process_sharegpt_row
     elif args.dataset == "sharegpt4v":
         ds = load_dataset("Lin-Chen/ShareGPT4V", "ShareGPT4V")["train"]
+        raise Exception("Not supported sharegpt4v now")
+        download_vlm_dataset(args.dataset)
         proc_fn = process_sharegpt4v_row
     elif args.dataset == "allava4v":
         ds = load_dataset("FreedomIntelligence/ALLaVA-4V", name="allava_laion")[
             "instruct"
         ]
+        download_vlm_dataset(args.dataset)
         proc_fn = process_sharegpt4v_row
     elif args.dataset == "opc":
         if args.opc_subset == "all":
@@ -284,7 +335,6 @@ def main():
         raise ValueError(
             f"This script only supports ultrachat, sharegpt, sharegpt4v, allava4v, opc, and perfect-blend-gptoss-20B datasets for demo purpose, if you wish to use other datasets, please modify this script."
         )
-
     # filter and split dataset
     if args.sample_size is not None and args.sample_size < len(ds):
         ds = ds.select(range(args.sample_size))

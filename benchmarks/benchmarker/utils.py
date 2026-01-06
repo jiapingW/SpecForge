@@ -15,6 +15,8 @@ class BenchmarkMetrics:
 
     latency: float
     output_throughput: float
+    avg_tpot: float  # 新增: 平均每个输出token的耗时 (ms)
+    avg_input_len: float  # 新增: 平均输入长度 (tokens)
     accept_length: float
     accuracy: Optional[float] = None
     num_questions: int = 0
@@ -40,32 +42,42 @@ def compute_metrics(
     Returns:
         BenchmarkMetrics object with computed metrics
     """
+    # Define keys to check
+    keys_to_check = [answer_key]
+    if additional_answer_keys:
+        keys_to_check += additional_answer_keys
+
     # Compute output tokens
     num_output_tokens = 0
-    if additional_answer_keys:
-        for key in [answer_key] + additional_answer_keys:
-            num_output_tokens += sum(
-                s.get_meta_info(key)["completion_tokens"] for s in states
-            )
-    else:
-        num_output_tokens = sum(
-            s.get_meta_info(answer_key)["completion_tokens"] for s in states
+    for key in keys_to_check:
+        num_output_tokens += sum(
+            s.get_meta_info(key)["completion_tokens"] for s in states
         )
 
     output_throughput = num_output_tokens / latency if latency > 0 else 0.0
+
+    # 新增: 计算 TPOT (ms/token)
+    # TPOT = 总延迟(ms) / 总输出token数
+    avg_tpot = (latency * 1000) / num_output_tokens if num_output_tokens > 0 else 0.0
+
+    # 新增: 计算平均输入长度
+    # 累加所有请求中该生成步骤的 prompt_tokens
+    num_input_tokens = 0
+    for key in keys_to_check:
+        # get("prompt_tokens", 0) 防止旧版本 meta info 中没有该字段
+        num_input_tokens += sum(
+            s.get_meta_info(key).get("prompt_tokens", 0) for s in states
+        )
+    
+    avg_input_len = num_input_tokens / len(states) if states else 0.0
 
     # Compute accept length (speculative decoding metric)
     has_verify = "spec_verify_ct" in states[0].get_meta_info(answer_key)
     if has_verify:
         num_verify_tokens = 0
-        if additional_answer_keys:
-            for key in [answer_key] + additional_answer_keys:
-                num_verify_tokens += sum(
-                    s.get_meta_info(key).get("spec_verify_ct", 0) for s in states
-                )
-        else:
-            num_verify_tokens = sum(
-                s.get_meta_info(answer_key).get("spec_verify_ct", 0) for s in states
+        for key in keys_to_check:
+            num_verify_tokens += sum(
+                s.get_meta_info(key).get("spec_verify_ct", 0) for s in states
             )
 
         if num_verify_tokens == 0:
@@ -78,6 +90,8 @@ def compute_metrics(
     return BenchmarkMetrics(
         latency=latency,
         output_throughput=output_throughput,
+        avg_tpot=avg_tpot,            # 传入新指标
+        avg_input_len=avg_input_len,  # 传入新指标
         accept_length=accept_length,
         num_questions=len(states),
     )
@@ -98,6 +112,8 @@ def print_results(
     """
     avg_latency = np.mean([m.latency for m in metrics_list])
     avg_throughput = np.mean([m.output_throughput for m in metrics_list])
+    avg_tpot = np.mean([m.avg_tpot for m in metrics_list])            # 计算平均 TPOT
+    avg_input_len = np.mean([m.avg_input_len for m in metrics_list])  # 计算平均输入长度
     avg_accept_length = np.mean([m.accept_length for m in metrics_list])
 
     print(f"\n{'='*50}")
@@ -114,6 +130,9 @@ def print_results(
             print(f"Average Accuracy: None")
     print(f"Average Latency: {avg_latency:.3f} s")
     print(f"Average Output throughput: {avg_throughput:.3f} token/s")
+    # 输出新增指标
+    print(f"Average TPOT: {avg_tpot:.3f} ms/token") 
+    print(f"Average Input length: {avg_input_len:.3f} tokens")
     print(f"Average Accept length: {avg_accept_length:.3f}")
     print(f"{'='*50}\n")
 

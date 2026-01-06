@@ -15,7 +15,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, Qwen2_5_VLForConditionalGeneration
 
 from specforge.distributed import get_tp_device_mesh, get_tp_group
 from specforge.utils import padding
@@ -77,8 +77,12 @@ class Eagle3TargetModel(ABC):
         Set the layers to capture the aux hidden states from the target model outputs.
         """
         if aux_hidden_states_layers is None:
+            # get llm layers
             if hasattr(self.model.config, "num_hidden_layers"):
                 num_layers = self.model.config.num_hidden_layers
+            # get vlm layers
+            elif hasattr(self.model.config, "text_config") and hasattr(self.model.config.text_config, "num_hidden_layers"):
+                num_layers = self.model.config.text_config.num_hidden_layers
             else:
                 raise ValueError(
                     f"Failed to set aux hidden states layers as model config {self.model.config} does not have num_hidden_layers"
@@ -95,10 +99,69 @@ class Eagle3TargetModel(ABC):
 
 
 class HFEagle3TargetModel(Eagle3TargetModel):
+    vlm_set = {"qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe"}
 
     def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model
+
+
+    @classmethod
+    def load_vlm(
+        cls,
+        pretrained_model_name_or_path: str,
+        torch_dtype: torch.dtype = None,
+        cache_dir: Optional[str] = None,
+        model_type: str = None,
+        **kwargs,
+    ) -> "HFEagle3TargetModel":
+        """
+        Load VLM from transformers according to model type.
+        """
+        target_model = None
+        if model_type == "qwen2_5_vl":
+            from transformers import Qwen2_5_VLForConditionalGeneration
+            target_model = (
+                Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    pretrained_model_name_or_path,
+                    torch_dtype=torch_dtype,
+                    cache_dir=cache_dir,
+                    **kwargs,
+                )
+                .eval()
+            )
+        elif model_type == "qwen3_vl":
+            # from .forkedpdb import ForkedPdb
+            # ForkedPdb().set_trace()
+            from transformers import Qwen3VLForConditionalGeneration
+            target_model = (
+                Qwen3VLForConditionalGeneration.from_pretrained(
+                    pretrained_model_name_or_path,
+                    torch_dtype=torch_dtype,
+                    cache_dir=cache_dir,
+                    **kwargs,
+                )
+                .eval()
+            )
+            # from .forkedpdb import ForkedPdb
+            # ForkedPdb().set_trace()
+            print(target_model.model.language_model.layers[0].self_attn.q_proj.parameters())  
+        elif model_type == "qwen3_vl_moe":
+            from transformers import Qwen3VLMoeForConditionalGeneration
+            target_model = (
+                Qwen3VLMoeForConditionalGeneration.from_pretrained(
+                    pretrained_model_name_or_path,
+                    torch_dtype=torch_dtype,
+                    cache_dir=cache_dir,
+                    **kwargs,
+                )
+                .eval()
+            )
+        else:
+            raise Exception(f"Not supported model_type:{model_type}")
+        return target_model
+
+
 
     @classmethod
     def from_pretrained(
@@ -107,6 +170,7 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         torch_dtype: torch.dtype = None,
         device: str = None,
         cache_dir: Optional[str] = None,
+        model_type: str = None,
         **kwargs,
     ) -> "HFEagle3TargetModel":
         """
@@ -124,14 +188,19 @@ class HFEagle3TargetModel(Eagle3TargetModel):
             device_kwargs = {
                 "device_map": device,
             }
+        if model_type in cls.vlm_set:
+            if tp_size>1:
+                raise Exception("Qwen VL series models don't support TP use transformers backend.")
+            target_model = cls.load_vlm(pretrained_model_name_or_path, torch_dtype, cache_dir, model_type, **device_kwargs,**kwargs)
 
-        target_model = AutoModelForCausalLM.from_pretrained(
-            pretrained_model_name_or_path,
-            torch_dtype=torch_dtype,
-            cache_dir=cache_dir,
-            **device_kwargs,
-            **kwargs,
-        )
+        else:
+            target_model = AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path,
+                torch_dtype=torch_dtype,
+                cache_dir=cache_dir,
+                **device_kwargs,
+                **kwargs,
+            )
         return cls(target_model)
 
     def _get_transformer_layers(self):
@@ -566,6 +635,7 @@ def get_eagle3_target_model(
     torch_dtype: torch.dtype = None,
     device: str = None,
     cache_dir: Optional[str] = None,
+    model_type: str = None,
     **kwargs,
 ) -> Eagle3TargetModel:
     if backend == "sglang":
@@ -582,6 +652,7 @@ def get_eagle3_target_model(
             torch_dtype=torch_dtype,
             device=device,
             cache_dir=cache_dir,
+            model_type=model_type,
             **kwargs,
         )
     elif backend == "custom":

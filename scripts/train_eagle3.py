@@ -245,34 +245,35 @@ def build_target_model(
         The target model.
     """
     if is_online:
-        if (
-            args.is_vlm
-            and draft_model_config.target_model_type == "qwen2_5_vl"
-            and args.tp_size == 1
-        ):
-            from transformers import Qwen2_5_VLForConditionalGeneration
+        # if (
+        #     args.is_vlm
+        #     and draft_model_config.target_model_type == "qwen2_5_vl"
+        #     and args.tp_size == 1
+        # ):
+        #     from transformers import Qwen2_5_VLForConditionalGeneration
 
-            target_model = (
-                Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    pretrained_model_name_or_path=args.target_model_path,
-                    torch_dtype=torch.bfloat16,
-                )
-                .eval()
-                .cuda()
-            )
+        #     target_model = (
+        #         Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        #             pretrained_model_name_or_path=args.target_model_path,
+        #             torch_dtype=torch.bfloat16,
+        #         )
+        #         .eval()
+        #         .cuda()
+        #     )
+        # else:
+        if args.target_model_backend == "sglang":
+            target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
         else:
-            if args.target_model_backend == "sglang":
-                target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
-            else:
-                target_model_kwargs = {}
-            target_model = get_eagle3_target_model(
-                pretrained_model_name_or_path=args.target_model_path,
-                backend=args.target_model_backend,
-                torch_dtype=torch.bfloat16,
-                device="cuda",
-                cache_dir=args.model_download_dir,
-                **target_model_kwargs,
-            )
+            target_model_kwargs = {}
+        target_model = get_eagle3_target_model(
+            pretrained_model_name_or_path=args.target_model_path,
+            backend=args.target_model_backend,
+            torch_dtype=torch.bfloat16,
+            device="cuda",
+            cache_dir=args.model_download_dir,
+            model_type=draft_model_config.target_model_type,
+            **target_model_kwargs,
+        )
 
         # set the aux hidden states layers
         if (
@@ -633,7 +634,6 @@ def main():
     train_dataloader, vocab_mapping_path, eval_dataloader = build_dataloaders(
         args, draft_model_config, processor
     )
-
     # we load the vocab mapping then
     draft_model.load_vocab_mapping(vocab_mapping_path)
     print_with_rank("Loaded vocab mapping")
@@ -655,7 +655,7 @@ def main():
     # ================================================
     if (
         args.is_vlm
-        and getattr(draft_model_config, "target_model_type", None) == "qwen2_5_vl"
+        and getattr(draft_model_config, "target_model_type", None) in ["qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe"]
     ):
         eagle3_model = QwenVLOnlineEagle3Model(
             target_model=target_model,
@@ -663,6 +663,7 @@ def main():
             processor=processor,
             length=args.ttt_length,
             attention_backend=args.attention_backend,
+            target_model_type=getattr(draft_model_config, "target_model_type", None),
         )
     else:
         eagle3_model = OnlineEagle3Model(
@@ -749,6 +750,7 @@ def main():
                     print(f"End profile {output_path=}")
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(output_path)
+                    print('##############################')
 
             # ================================================
             # 7.1 Training Step
