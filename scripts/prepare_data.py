@@ -237,7 +237,7 @@ def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
     total_skipped_count = 0
     with open(train_output_jsonl_path, "w") as f:
         for item in tqdm(train_ds, desc=f"Processing {dataset_name} dataset"):
-            row, skipped_count = proc_fn(item, args.dataset_name)
+            row, skipped_count = proc_fn(item, dataset_name)
             if row is None:
                 continue
             total_skipped_count += skipped_count
@@ -247,7 +247,7 @@ def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
         test_output_jsonl_path = output_path.joinpath(f"{dataset_name}_test.jsonl")
         with open(test_output_jsonl_path, "w") as f:
             for item in tqdm(test_ds, desc=f"Processing {dataset_name} test dataset"):
-                row, skipped_count = proc_fn(item, args.dataset_name)
+                row, skipped_count = proc_fn(item, dataset_name)
                 if row is None:
                     continue
                 total_skipped_count += skipped_count
