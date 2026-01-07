@@ -2,12 +2,20 @@ import argparse
 import json
 import os
 import subprocess
+<<<<<<< HEAD
 import requests
 from pathlib import Path
 from typing import Dict, Tuple
 
 from datasets import concatenate_datasets, load_dataset, config
+=======
+from pathlib import Path
+from typing import Dict, Tuple
+
+>>>>>>> wjp_upstream/support_download_allava4v
 from tqdm import tqdm
+
+from datasets import concatenate_datasets, config, load_dataset
 
 """
 This script will convert the ultrachat/sharegpt dataset to the following schema in jsonl format:
@@ -41,6 +49,10 @@ def parse_args():
             "sharegpt",
             "eaglechat",
             "perfectblend",
+            "perfectblend-llama3.1-8b-instruct",
+            "perfectblend-llama3.3-70b-instruct",
+            "perfectblend-llama4-scout-instruct",
+            "perfectblend-llama4-maverick-instruct",
             "magpie-qwen2.5-pro-1m-v0.1",
             "sharegpt4v",
             "allava4v",
@@ -86,6 +98,7 @@ def parse_args():
     return parser.parse_args()
 
 
+<<<<<<< HEAD
 def _download_file(url: str, dest_path: str) -> None:
     """Download a file from URL to destination path."""
     if os.path.exists(dest_path):
@@ -105,6 +118,20 @@ def get_cache_dir(dataset_name):
         cache_dir = os.path.join(config.HF_DATASETS_CACHE, "FreedomIntelligence", "ALLaVA")
     else:
         raise Exception(f"Don't support {dataset_name}")
+=======
+def get_cache_dir(dataset_name):
+    cache_dir = None
+    if dataset_name == "sharegpt4v":
+        raise ValueError("Downloading 'sharegpt4v' is not supported.")
+    elif dataset_name == "allava4v":
+        cache_dir = os.path.join(
+            config.HF_DATASETS_CACHE, "FreedomIntelligence", "ALLaVA"
+        )
+    else:
+        raise ValueError(
+            f"Dataset '{dataset_name}' is not a supported VLM dataset for download."
+        )
+>>>>>>> wjp_upstream/support_download_allava4v
     return cache_dir
 
 
@@ -113,6 +140,7 @@ def download_vlm_dataset(dataset_name: str) -> None:
     if dataset_name == "sharegpt4v":
         raise Exception("Don't Support Download sharegpt4v.")
     elif dataset_name == "allava4v":
+<<<<<<< HEAD
         url = "https://raw.githubusercontent.com/FreedomIntelligence/ALLaVA/main/download/download_laion.sh"
         cache_dir = get_cache_dir(dataset_name)
         script_path = os.path.join(cache_dir, "download_laion.sh") 
@@ -120,6 +148,20 @@ def download_vlm_dataset(dataset_name: str) -> None:
         os.chmod(script_path, 0o755)
         if not os.path.exists(os.path.join(cache_dir, "allava_laion")):
             result = subprocess.run( # 需要去检测为什么unzip执行不正常，通过修改HF_HOME进行实现
+=======
+        cache_dir = get_cache_dir(dataset_name)
+        os.makedirs(cache_dir, exist_ok=True)
+        script_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "datasets",
+            "download_laion.sh",
+        )
+        os.chmod(script_path, 0o755)
+        if not os.path.exists(
+            os.path.join(cache_dir, "allava_laion", "image_chunks", "images_0.zip")
+        ):
+            result = subprocess.run(
+>>>>>>> wjp_upstream/support_download_allava4v
                 ["bash", script_path],
                 cwd=cache_dir,
                 capture_output=True,
@@ -127,11 +169,21 @@ def download_vlm_dataset(dataset_name: str) -> None:
             )
             if result.returncode != 0:
                 raise RuntimeError(f"Download image dataset failed: {result.stderr}")
+<<<<<<< HEAD
+=======
+            print("##### allava4v dataset Download Complete #####")
+        else:
+            print("##### allava4v dataset has existed.")
+>>>>>>> wjp_upstream/support_download_allava4v
     else:
         raise Exception(f"Don't support {dataset_name}")
 
 
+<<<<<<< HEAD
 def process_ultrachat_row(row: Dict, dataset_name: str=None) -> Tuple[Dict, int]:
+=======
+def process_ultrachat_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
+>>>>>>> wjp_upstream/support_download_allava4v
     """Process a row from the ultrachat dataset.
 
     The function expects a row with the following schema:
@@ -153,7 +205,11 @@ def process_ultrachat_row(row: Dict, dataset_name: str=None) -> Tuple[Dict, int]
     return row, 0
 
 
+<<<<<<< HEAD
 def process_sharegpt_row(row: Dict, dataset_name: str=None) -> Tuple[Dict, int]:
+=======
+def process_sharegpt_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
+>>>>>>> wjp_upstream/support_download_allava4v
     """
     sharegpt dataset schema:
     {
@@ -181,7 +237,11 @@ def process_sharegpt_row(row: Dict, dataset_name: str=None) -> Tuple[Dict, int]:
     return row, skipped_count
 
 
+<<<<<<< HEAD
 def process_sharegpt4v_row(row, dataset_name: str=None) -> Dict:
+=======
+def process_sharegpt4v_row(row, dataset_name: str = None) -> Dict:
+>>>>>>> wjp_upstream/support_download_allava4v
     """
     sharegpt4v dataset schema:
     {
@@ -198,7 +258,11 @@ def process_sharegpt4v_row(row, dataset_name: str=None) -> Dict:
     """
     cache_dir = get_cache_dir(dataset_name)
     conversations = row["conversations"]
+<<<<<<< HEAD
     image = os.path.join(cache_dir, f"{row["image"]}")
+=======
+    image = os.path.join(cache_dir, row["image"])
+>>>>>>> wjp_upstream/support_download_allava4v
     if not os.path.exists(image):
         print(f"Image path {image} does not exist, skipping this sample.")
         return None, None
@@ -237,20 +301,26 @@ def process_and_save_ds(train_ds, test_ds, output_path, proc_fn, dataset_name):
     total_skipped_count = 0
     with open(train_output_jsonl_path, "w") as f:
         for item in tqdm(train_ds, desc=f"Processing {dataset_name} dataset"):
-            row, skipped_count = proc_fn(item, dataset_name)
-            if row is None:
-                continue
-            total_skipped_count += skipped_count
+            if proc_fn is not None:
+                row, skipped_count = proc_fn(item, dataset_name)
+                if row is None:
+                    continue
+                total_skipped_count += skipped_count
+            else:
+                row = item
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     if test_ds is not None:
         test_output_jsonl_path = output_path.joinpath(f"{dataset_name}_test.jsonl")
         with open(test_output_jsonl_path, "w") as f:
             for item in tqdm(test_ds, desc=f"Processing {dataset_name} test dataset"):
-                row, skipped_count = proc_fn(item, dataset_name)
-                if row is None:
-                    continue
-                total_skipped_count += skipped_count
+                if proc_fn is not None:
+                    row, skipped_count = proc_fn(item, dataset_name)
+                    if row is None:
+                        continue
+                    total_skipped_count += skipped_count
+                else:
+                    row = item
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     if total_skipped_count > 0:
@@ -300,6 +370,30 @@ def main():
         ds = load_dataset("mlabonne/open-perfectblend")["train"]
         ds = ds.map(add_index, with_indices=True)
         proc_fn = process_sharegpt_row
+    elif args.dataset == "perfectblend-llama3.1-8b-instruct":
+        ds = load_dataset("frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct")[
+            "train"
+        ]
+        ds = ds.map(add_index, with_indices=True)
+        proc_fn = None
+    elif args.dataset == "perfectblend-llama3.3-70b-instruct":
+        ds = load_dataset(
+            "frankleeeee/PerfectBlend-Regenerated-Llama-3.3-70B-Instruct"
+        )["train"]
+        ds = ds.map(add_index, with_indices=True)
+        proc_fn = None
+    elif args.dataset == "perfectblend-llama4-scout-instruct":
+        ds = load_dataset(
+            "frankleeeee/PerfectBlend-Regenerated-Llama-4-Scout-17B-16E-Instruct"
+        )["train"]
+        ds = ds.map(add_index, with_indices=True)
+        proc_fn = None
+    elif args.dataset == "perfectblend-llama4-maverick-instruct":
+        ds = load_dataset(
+            "frankleeeee/PerfectBlend-Regenerated-Llama-4-Maverick-17B-128E-Instruct"
+        )["train"]
+        ds = ds.map(add_index, with_indices=True)
+        proc_fn = None
     elif args.dataset == "magpie-qwen2.5-pro-1m-v0.1":
         ds = load_dataset("Magpie-Align/Magpie-Qwen2.5-Pro-1M-v0.1")["train"]
         ds = ds.rename_column("uuid", "id")

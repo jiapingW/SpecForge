@@ -27,9 +27,10 @@ from collections import Counter
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-from datasets import Dataset as HFDataset
 from tqdm import tqdm
 from transformers import ImageProcessingMixin, PreTrainedTokenizer
+
+from datasets import Dataset as HFDataset
 
 try:
     from qwen_vl_utils import process_vision_info
@@ -41,7 +42,7 @@ except ImportError:
 
 from specforge.utils import padding
 
-from .parse import GeneralParser, HarmonyParser
+from .parse import GeneralParser, HarmonyParser, ThinkingParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
 
 # define a type called conversation
@@ -141,6 +142,8 @@ def preprocess_conversations(
 
     if chat_template.parser_type == "general":
         parser = GeneralParser(tokenizer, chat_template)
+    elif chat_template.parser_type == "thinking":
+        parser = ThinkingParser(tokenizer, chat_template)
     elif chat_template.parser_type == "openai-harmony":
         parser = HarmonyParser(tokenizer, chat_template)
     else:
