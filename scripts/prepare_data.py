@@ -2,17 +2,9 @@ import argparse
 import json
 import os
 import subprocess
-<<<<<<< HEAD
-import requests
 from pathlib import Path
 from typing import Dict, Tuple
 
-from datasets import concatenate_datasets, load_dataset, config
-=======
-from pathlib import Path
-from typing import Dict, Tuple
-
->>>>>>> wjp_upstream/support_download_allava4v
 from tqdm import tqdm
 
 from datasets import concatenate_datasets, config, load_dataset
@@ -98,27 +90,6 @@ def parse_args():
     return parser.parse_args()
 
 
-<<<<<<< HEAD
-def _download_file(url: str, dest_path: str) -> None:
-    """Download a file from URL to destination path."""
-    if os.path.exists(dest_path):
-        return
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    resp = requests.get(url)
-    resp.raise_for_status()
-    with open(dest_path, "w") as f:
-        f.write(resp.text)
-
-
-def get_cache_dir(dataset_name):
-    cache_dir = None
-    if dataset_name == "sharegpt4v":
-        raise Exception("Don't Support Download sharegpt4v.")
-    elif dataset_name == "allava4v":
-        cache_dir = os.path.join(config.HF_DATASETS_CACHE, "FreedomIntelligence", "ALLaVA")
-    else:
-        raise Exception(f"Don't support {dataset_name}")
-=======
 def get_cache_dir(dataset_name):
     cache_dir = None
     if dataset_name == "sharegpt4v":
@@ -131,7 +102,6 @@ def get_cache_dir(dataset_name):
         raise ValueError(
             f"Dataset '{dataset_name}' is not a supported VLM dataset for download."
         )
->>>>>>> wjp_upstream/support_download_allava4v
     return cache_dir
 
 
@@ -140,15 +110,6 @@ def download_vlm_dataset(dataset_name: str) -> None:
     if dataset_name == "sharegpt4v":
         raise Exception("Don't Support Download sharegpt4v.")
     elif dataset_name == "allava4v":
-<<<<<<< HEAD
-        url = "https://raw.githubusercontent.com/FreedomIntelligence/ALLaVA/main/download/download_laion.sh"
-        cache_dir = get_cache_dir(dataset_name)
-        script_path = os.path.join(cache_dir, "download_laion.sh") 
-        _download_file(url, script_path)
-        os.chmod(script_path, 0o755)
-        if not os.path.exists(os.path.join(cache_dir, "allava_laion")):
-            result = subprocess.run( # 需要去检测为什么unzip执行不正常，通过修改HF_HOME进行实现
-=======
         cache_dir = get_cache_dir(dataset_name)
         os.makedirs(cache_dir, exist_ok=True)
         script_path = os.path.join(
@@ -161,7 +122,6 @@ def download_vlm_dataset(dataset_name: str) -> None:
             os.path.join(cache_dir, "allava_laion", "image_chunks", "images_0.zip")
         ):
             result = subprocess.run(
->>>>>>> wjp_upstream/support_download_allava4v
                 ["bash", script_path],
                 cwd=cache_dir,
                 capture_output=True,
@@ -169,21 +129,14 @@ def download_vlm_dataset(dataset_name: str) -> None:
             )
             if result.returncode != 0:
                 raise RuntimeError(f"Download image dataset failed: {result.stderr}")
-<<<<<<< HEAD
-=======
             print("##### allava4v dataset Download Complete #####")
         else:
             print("##### allava4v dataset has existed.")
->>>>>>> wjp_upstream/support_download_allava4v
     else:
         raise Exception(f"Don't support {dataset_name}")
 
 
-<<<<<<< HEAD
-def process_ultrachat_row(row: Dict, dataset_name: str=None) -> Tuple[Dict, int]:
-=======
 def process_ultrachat_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
->>>>>>> wjp_upstream/support_download_allava4v
     """Process a row from the ultrachat dataset.
 
     The function expects a row with the following schema:
@@ -205,11 +158,7 @@ def process_ultrachat_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, in
     return row, 0
 
 
-<<<<<<< HEAD
-def process_sharegpt_row(row: Dict, dataset_name: str=None) -> Tuple[Dict, int]:
-=======
 def process_sharegpt_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
->>>>>>> wjp_upstream/support_download_allava4v
     """
     sharegpt dataset schema:
     {
@@ -237,11 +186,7 @@ def process_sharegpt_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int
     return row, skipped_count
 
 
-<<<<<<< HEAD
-def process_sharegpt4v_row(row, dataset_name: str=None) -> Dict:
-=======
 def process_sharegpt4v_row(row, dataset_name: str = None) -> Dict:
->>>>>>> wjp_upstream/support_download_allava4v
     """
     sharegpt4v dataset schema:
     {
@@ -258,11 +203,7 @@ def process_sharegpt4v_row(row, dataset_name: str = None) -> Dict:
     """
     cache_dir = get_cache_dir(dataset_name)
     conversations = row["conversations"]
-<<<<<<< HEAD
-    image = os.path.join(cache_dir, f"{row["image"]}")
-=======
     image = os.path.join(cache_dir, row["image"])
->>>>>>> wjp_upstream/support_download_allava4v
     if not os.path.exists(image):
         print(f"Image path {image} does not exist, skipping this sample.")
         return None, None
