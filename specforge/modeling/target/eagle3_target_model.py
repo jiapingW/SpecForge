@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 import torch
 import torch.distributed as dist
@@ -19,6 +19,7 @@ from transformers import AutoModelForCausalLM, Qwen2_5_VLForConditionalGeneratio
 
 from specforge.distributed import get_tp_device_mesh, get_tp_group
 from specforge.utils import padding
+from specforge.data import VLMInputData
 
 from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
 from .sglang_backend.utils import LogitsProcessorForEAGLE3
@@ -101,9 +102,12 @@ class Eagle3TargetModel(ABC):
 class HFEagle3TargetModel(Eagle3TargetModel):
     vlm_set = {"qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe"}
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, is_vlm: bool = False):
         super().__init__()
         self.model = model
+        # VLM args
+        self.is_vlm = is_vlm
+        self.rope_deltas = None
 
 
     @classmethod
@@ -177,7 +181,7 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         Initialize the HuggingFace target model backend from a pretrained model path.
         """
         tp_size = get_tp_group().size()
-
+        is_vlm = False
         if tp_size > 1:
             device_kwargs = {
                 "tp_plan": "auto",
@@ -189,10 +193,10 @@ class HFEagle3TargetModel(Eagle3TargetModel):
                 "device_map": device,
             }
         if model_type in cls.vlm_set:
+            is_vlm = True
             if tp_size>1:
                 raise Exception("Qwen VL series models don't support TP use transformers backend.")
             target_model = cls.load_vlm(pretrained_model_name_or_path, torch_dtype, cache_dir, model_type, **device_kwargs,**kwargs)
-
         else:
             target_model = AutoModelForCausalLM.from_pretrained(
                 pretrained_model_name_or_path,
@@ -201,15 +205,18 @@ class HFEagle3TargetModel(Eagle3TargetModel):
                 **device_kwargs,
                 **kwargs,
             )
-        return cls(target_model)
+        return cls(target_model, is_vlm)
 
     def _get_transformer_layers(self):
         """
         Helper to find the module list containing the transformer layers.
         Adapts to common architectures (Llama, Qwen, Mistral, OPT, etc.)
         """
-        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-            return self.model.model.layers
+        if hasattr(self.model, "model"):
+            if hasattr(self.model.model, "layers"):
+                return self.model.model.layers
+            elif hasattr(self.model.model, "language_model") and hasattr(self.model.model.language_model, "layers"): # handle vlm model
+                return self.model.model.language_model.layers
         elif hasattr(self.model, "layers"):
             return self.model.layers
         elif hasattr(self.model, "transformer") and hasattr(
@@ -227,11 +234,19 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        vlm_input: Optional[VLMInputData] = None,
     ) -> Eagle3TargetOutput:
         """
         Optimized HF backend:
         Instead of returning all hidden states (memory heavy), we use forward hooks
         to capture only the specific layers required by Eagle3.
+
+        Args:
+            input_ids: Input token IDs.
+            attention_mask: Attention mask.
+            loss_mask: Loss mask used for training.
+            vlm_input: Dictionary containing VLM specific arguments (pixel_values, grid_thw, etc.).
+                       If self.is_vlm is True, this should be provided.
         """
         captured_states = {}
         handles = []
@@ -247,7 +262,6 @@ class HFEagle3TargetModel(Eagle3TargetModel):
                 captured_states[layer_idx] = hidden
 
             return hook
-
         # Locate the transformer layers ModuleList
         layers = self._get_transformer_layers()
 
@@ -263,15 +277,28 @@ class HFEagle3TargetModel(Eagle3TargetModel):
                     f"Layer index {idx} out of bounds for model with {len(layers)} layers."
                 )
 
+        forward_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "use_cache": False,
+            "output_attentions": False,
+            "output_hidden_states": False,
+        }
+
+        if self.is_vlm:
+            # construct vlm forward args
+            vlm_input = vlm_input.to_kwargs()
+            forward_kwargs.update(vlm_input)            
+            if self.model.config.model_type in {"qwen3_vl", "qwen3_vl_moe"}:
+                forward_kwargs.pop("second_per_grid_ts", None)
+            
+            # 过滤 None 参数 (VLM 敏感)
+            forward_kwargs = {k: v for k, v in forward_kwargs.items() if v is not None}
+
         try:
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=False,
-                output_attentions=False,
-                output_router_logits=False,
-                use_cache=False,
-            )
+            outputs = self.model(**forward_kwargs)
+            if hasattr(outputs, "rope_deltas"):
+                self.rope_deltas = outputs.rope_deltas
             target = outputs.logits
         finally:
             # Always remove hooks to prevent memory leaks or side effects on subsequent calls

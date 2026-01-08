@@ -30,6 +30,7 @@ from specforge.data import (
     build_offline_eagle3_dataset,
     generate_vocab_mapping_file,
     prepare_dp_dataloaders,
+    VLMInputData,
 )
 from specforge.distributed import (
     destroy_distributed,
@@ -530,13 +531,40 @@ def run_forward(
     is_online: bool = True,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     if args.is_vlm:
+        vlm_input = VLMInputData(pixel_values=data["pixel_values"].cuda(),image_grid_thw=data["image_grid_thw"].cuda())
+        if is_online:
+            from forkedpdb import ForkedPdb
+            # ForkedPdb().set_trace()
+            eagle3_data = target_model.generate_eagle3_data(
+                input_ids=data["input_ids"].cuda(),
+                attention_mask=data["attention_mask"].cuda(),
+                loss_mask=data["loss_mask"].cuda(),
+                vlm_input=vlm_input,
+            )
+            input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
+            attention_mask = get_dp_data_shard_from_tp(eagle3_data.attention_mask)
+            loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
+            target = get_dp_data_shard_from_tp(eagle3_data.target)
+            hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+        else:
+            raise Exception("Not supported vlm offline training.")
+    
         plosses, _, acces = eagle3_model(
-            input_ids=data["input_ids"].cuda(),
-            attention_mask=data["attention_mask"].cuda(),
-            loss_mask=data["loss_mask"].cuda(),
-            pixel_values=data["pixel_values"].cuda(),
-            image_grid_thw=data["image_grid_thw"].cuda(),
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            target=target,
+            hidden_states=hidden_states,
+            vlm_input=vlm_input,
         )
+
+        # plosses, _, acces = eagle3_model(
+        #     input_ids=data["input_ids"].cuda(),
+        #     attention_mask=data["attention_mask"].cuda(),
+        #     loss_mask=data["loss_mask"].cuda(),
+        #     pixel_values=data["pixel_values"].cuda(),
+        #     image_grid_thw=data["image_grid_thw"].cuda(),
+        # )
     else:
         if is_online:
             # we generate the eagle3 using the target model in an online fashion
@@ -780,7 +808,8 @@ def main():
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(output_path)
                     print('##############################')
-
+            from forkedpdb import ForkedPdb
+            # ForkedPdb().set_trace()
             # ================================================
             # 7.1 Training Step
             # ================================================

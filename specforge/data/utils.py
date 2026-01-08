@@ -20,6 +20,7 @@
 
 import re
 from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, asdict, fields
 
 import torch
 import torch.distributed as dist
@@ -226,6 +227,74 @@ class VlmDataCollatorWithPadding:
                 [self.paddingtensor(item["target"], max_length) for item in features]
             )
         return batch
+
+
+@dataclass
+class VLMInputData:
+    """
+    Container for VLM-specific inputs needed by VL models.
+    """
+    
+    # Batch image pixel values, used for VLM models
+    # Shape: (num_images, channel, height, width) or flattened equivalent
+    pixel_values: Optional[torch.Tensor] = None
+    
+    # Batch video pixel values, optional for models supporting videos
+    # Shape: (num_videos, num_frames, channel, height, width)
+    pixel_values_videos: Optional[torch.Tensor] = None
+    
+    # Image grid topology info (t, h, w)
+    # Shape: (num_images, 3)
+    image_grid_thw: Optional[torch.Tensor] = None
+    
+    # Video grid topology info
+    # Shape: (num_videos, 3)
+    video_grid_thw: Optional[torch.Tensor] = None
+    
+    # Per-grid temporal interval, specific for Qwen2.5-VL video support
+    # Shape: (num_videos, ) or similar
+    second_per_grid_ts: Optional[torch.Tensor] = None
+
+    def to(self, device: torch.device, non_blocking: bool = False) -> "Eagle3VLMInput":
+        """
+        Moves all tensor fields to the specified device in-place.
+        Returns self for method chaining.
+        """
+        for field in fields(self):
+            value = getattr(self, field.name)
+            if isinstance(value, torch.Tensor):
+                setattr(self, field.name, value.to(device, non_blocking=non_blocking))
+        return self
+
+    def to_kwargs(self) -> Dict[str, Any]:
+        """
+        Converts to a dictionary suitable for passing to model.forward(**kwargs).
+        Automatically removes keys with None values to prevent HF errors.
+        """
+        return {
+            k: v for k, v in asdict(self).items() 
+            if v is not None
+        }
+
+    def __bool__(self) -> bool:
+        """
+        Returns True if at least one field is not None.
+        Usage: if vlm_input: ...
+        """
+        return any(getattr(self, f.name) is not None for f in fields(self))
+
+    def __repr__(self) -> str:
+        """
+        Custom repr to show shapes of tensors for easier debugging.
+        """
+        info = []
+        for f in fields(self):
+            val = getattr(self, f.name)
+            if val is not None and isinstance(val, torch.Tensor):
+                info.append(f"{f.name}=Tensor{list(val.shape)}")
+            elif val is not None:
+                info.append(f"{f.name}={val}")
+        return f"VLMInputData({', '.join(info)})"
 
 
 def prepare_dp_dataloaders(

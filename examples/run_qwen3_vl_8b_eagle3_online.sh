@@ -30,6 +30,5 @@ torchrun \
     --dist-timeout 2000 \
     --report-to tensorboard \
     --profile \
-    --profile-start-step 10 \
-    --profile-num-steps 10 \
-    --profile-record-shapes
+    --profile-start-step 4 \
+    --profile-num-steps 1

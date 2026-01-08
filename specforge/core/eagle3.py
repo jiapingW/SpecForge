@@ -20,7 +20,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import torch
 import torch.nn as nn
@@ -36,6 +36,7 @@ from specforge.distributed import (
 )
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
+from specforge.data import VLMInputData
 
 
 class Eagle3Model(nn.Module):
@@ -364,6 +365,26 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         pixel_values: torch.Tensor,
         image_grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        Generate multimodal input embeddings by replacing special image tokens in the text sequence
+        with actual visual feature embeddings extracted from the provided images.
+
+        Args:
+            input_ids (torch.Tensor): 
+                Token IDs of the input sequence, containing special image token IDs (e.g., <image>).
+                Shape: (batch_size, seq_len).
+            pixel_values (torch.Tensor): 
+                Flattened image patch features or raw pixel values processed by the vision encoder.
+                Shape: (num_image_tokens, hidden_size) or as expected by the vision model.
+            image_grid_thw (torch.Tensor): 
+                Tensor describing the temporal-spatial grid structure of each image.
+                Shape: [B, H, W].
+
+        Returns:
+            torch.Tensor: 
+                Multimodal input embeddings with image tokens replaced by visual features.
+                Shape: (batch_size, seq_len, hidden_size).
+        """
         # get input embeding with image
         # inputs_embeds = self.target_model.model.get_input_embeddings()(input_ids)
         inputs_embeds = self.draft_model.embed_input_ids(input_ids)
@@ -397,14 +418,12 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        target: torch.Tensor,
         loss_mask: torch.Tensor,
+        hidden_states: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
-        pixel_values: Optional[torch.Tensor] = None,
-        pixel_values_videos: Optional[torch.Tensor] = None,
-        image_grid_thw: Optional[torch.Tensor] = None,
-        video_grid_thw: Optional[torch.Tensor] = None,
-        second_per_grid_ts: Optional[torch.Tensor] = None,
+        vlm_input: Optional[VLMInputData] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         """
         Online eagle model trainer, modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py#L711
@@ -415,23 +434,20 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             loss_mask: (batch, seq_len)
             past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
             position_ids: (batch, seq_len)
-            pixel_values: batch image pixel values, used for VLM models
-            pixel_values_videos: batch video pixel values, optional for models supporting videos
-            video_grid_thw: (batch, 3), video grid thw, optional
-            second_per_grid_ts: per-grid temporal interval for qwen2_5_vl video support
+            vlm_input: the image and video information of input.
         """
         # Step 0: prepare data with the target model
-        hidden_states, target, loss_mask, input_ids = self._prepare_data(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            loss_mask=loss_mask,
-            pixel_values=pixel_values,
-            pixel_values_videos=pixel_values_videos,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            second_per_grid_ts=second_per_grid_ts,
-        )
-
+        # hidden_states, target, loss_mask, input_ids = self._prepare_data(
+        #     input_ids=input_ids,
+        #     attention_mask=attention_mask,
+        #     loss_mask=loss_mask,
+        #     pixel_values=pixel_values,
+        #     pixel_values_videos=pixel_values_videos,
+        #     image_grid_thw=image_grid_thw,
+        #     video_grid_thw=video_grid_thw,
+        #     second_per_grid_ts=second_per_grid_ts,
+        # )
+        from .forkedpdb import ForkedPdb
         # Step 1: handle vocab size
         target_p_padded, position_mask = _compute_target_p_padded(
             target=target,
@@ -454,45 +470,45 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
 
-        attention_mask_tensor = (
+        base_attention_mask = (
             attention_mask
             if not isinstance(attention_mask, dict)
             else attention_mask["full_attention"]
         )
-        if attention_mask_tensor is not None and attention_mask_tensor.ndim == 4:
-            attention_mask_tensor = torch.diagonal(
-                attention_mask_tensor[:, 0], dim1=1, dim2=2
+        if base_attention_mask is not None and base_attention_mask.ndim == 4:
+            base_attention_mask = torch.diagonal(
+                base_attention_mask[:, 0], dim1=1, dim2=2
             )
-            attention_mask_tensor = (
-                attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
+            base_attention_mask = (
+                base_attention_mask / torch.finfo(base_attention_mask.dtype).min
             )
-            attention_mask_tensor = (1.0 - attention_mask_tensor).int()
+            base_attention_mask = (1.0 - base_attention_mask).int()
         if position_ids is None:
             get_rope_kwargs = {
                 "input_ids": input_ids,
-                "image_grid_thw": image_grid_thw,
-                "attention_mask": attention_mask_tensor,
+                "image_grid_thw": vlm_input.image_grid_thw,
+                "attention_mask": base_attention_mask,
             }
             if self.target_model_type in {"qwen3_vl", "qwen3_vl_moe"}:
-                get_rope_kwargs["video_grid_thw"] = video_grid_thw
+                get_rope_kwargs["video_grid_thw"] = vlm_input.video_grid_thw
             else:
-                get_rope_kwargs["video_grid_thw"] = video_grid_thw
-                get_rope_kwargs["second_per_grid_ts"] = second_per_grid_ts
+                get_rope_kwargs["video_grid_thw"] = vlm_input.video_grid_thw
+                get_rope_kwargs["second_per_grid_ts"] = vlm_input.second_per_grid_ts
             position_ids, rope_deltas = self.target_model.model.model.get_rope_index(
                 **get_rope_kwargs
             )
             if rope_deltas is not None:
                 self.rope_deltas = rope_deltas
             full_attention_mask = (
-                attention_mask_tensor.clone()
-                if attention_mask_tensor is not None
+                base_attention_mask.clone()
+                if base_attention_mask is not None
                 else None
             )
         else:
             position_ids = position_ids
             full_attention_mask = (
-                attention_mask_tensor.clone()
-                if attention_mask_tensor is not None
+                base_attention_mask.clone()
+                if base_attention_mask is not None
                 else None
             )
 
@@ -528,8 +544,9 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
-            # inputs_embeds = self._get_input_embeds(input_ids, pixel_values, image_grid_thw)
-            inputs_embeds = self.draft_model.embed_input_ids(input_ids)
+            # ForkedPdb().set_trace()
+            inputs_embeds = self._get_input_embeds(input_ids, vlm_input.pixel_values, vlm_input.image_grid_thw)
+            # inputs_embeds = self.draft_model.embed_input_ids(input_ids)
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
             # Step 5.2: run the draft model backbone
@@ -569,6 +586,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 input_ids = padding(input_ids, left=False)
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
+                # ForkedPdb().set_trace()
                 if self.target_model_type in ["qwen3_vl", "qwen3_vl_moe", "qwen2_5_vl"]:
                     # Shrink the cached mask so SDPA keeps the same view after padding.
                     # Roll the cached SDPA mask so it matches the new left-shifted window.
@@ -618,14 +636,14 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                     # qwen3_vl expects video grid kwargs rather than second_per_grid_ts, qwen2.5_vl still needs both.
                     rope_kwargs = {
                         "input_ids": input_ids,
-                        "image_grid_thw": image_grid_thw,
+                        "image_grid_thw": vlm_input.image_grid_thw,
                         "attention_mask": next_attention_tensor,
                     }
                     if self.target_model_type in {"qwen3_vl", "qwen3_vl_moe"}:
-                        rope_kwargs["video_grid_thw"] = video_grid_thw
+                        rope_kwargs["video_grid_thw"] = vlm_input.video_grid_thw
                     else:
-                        rope_kwargs["video_grid_thw"] = video_grid_thw
-                        rope_kwargs["second_per_grid_ts"] = second_per_grid_ts
+                        rope_kwargs["video_grid_thw"] = vlm_input.video_grid_thw
+                        rope_kwargs["second_per_grid_ts"] = vlm_input.second_per_grid_ts
                     position_ids, rope_deltas = self.target_model.model.model.get_rope_index(
                         **rope_kwargs
                     )
