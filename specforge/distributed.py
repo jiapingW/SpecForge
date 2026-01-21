@@ -7,25 +7,44 @@ from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
 
 from specforge.utils import print_with_rank
 
-_DEVICE_MESH = None
-_TP_DEVICE_MESH = None
-_TP_GROUP = None
-_DP_DEVICE_MESH = None
-_DP_GROUP = None
+_TARGET_DEVICE_MESH = None
+_TARGET_TP_GROUP = None
+_TARGET_TP_DEVICE_MESH = None
+_TARGET_DP_GROUP = None
+_TARGET_DP_DEVICE_MESH = None
+
+_DRAFT_DEVICE_MESH = None
 _DRAFT_DP_GROUP = None
+_DRAFT_DP_DEVICE_MESH = None
+_DRAFT_TP_GROUP = None
+_DRAFT_TP_DEVICE_MESH = None
 _DRAFT_SP_GROUP = None
+
 _SP_ULYSSES_GROUP = None
 _SP_RING_GROUP = None
 
 
-def get_tp_group():
-    global _TP_GROUP
-    return _TP_GROUP
+def get_target_tp_group():
+    global _TARGET_TP_GROUP
+    return _TARGET_TP_GROUP
 
 
-def get_dp_group():
-    global _DP_GROUP
-    return _DP_GROUP
+def get_target_dp_group():
+    global _TARGET_DP_GROUP
+    return _TARGET_DP_GROUP
+
+def get_target_device_mesh():
+    global _TARGET_DEVICE_MESH
+    return _TARGET_DEVICE_MESH
+
+
+def get_target_tp_device_mesh():
+    global _TARGET_TP_DEVICE_MESH
+    return _TARGET_TP_DEVICE_MESH
+
+def get_target_dp_device_mesh():
+    global _TARGET_DP_DEVICE_MESH
+    return _TARGET_DP_DEVICE_MESH
 
 
 def get_draft_dp_group():
@@ -37,40 +56,43 @@ def get_draft_sp_group():
     global _DRAFT_SP_GROUP
     return _DRAFT_SP_GROUP
 
+def get_draft_tp_group():
+    global _DRAFT_TP_GROUP
+    return _DRAFT_TP_GROUP
 
-def get_device_mesh():
-    global _DEVICE_MESH
-    return _DEVICE_MESH
+def get_draft_device_mesh():
+    global _DRAFT_DEVICE_MESH
+    return _DRAFT_DEVICE_MESH
 
+def get_draft_dp_device_mesh():
+    global _DRAFT_DP_DEVICE_MESH
+    return _DRAFT_DP_DEVICE_MESH
 
-def get_tp_device_mesh():
-    global _TP_DEVICE_MESH
-    return _TP_DEVICE_MESH
+def get_draft_tp_device_mesh():
+    global _DRAFT_TP_DEVICE_MESH
+    return _DRAFT_TP_DEVICE_MESH
 
-
-def get_dp_device_mesh():
-    global _DP_DEVICE_MESH
-    return _DP_DEVICE_MESH
-
-
-def get_sp_ulysses_group():
+def get_draft_sp_ulysses_group():
     global _SP_ULYSSES_GROUP
     return _SP_ULYSSES_GROUP
 
 
-def get_sp_ring_group():
+def get_draft_sp_ring_group():
     global _SP_RING_GROUP
     return _SP_RING_GROUP
 
 
 def init_distributed(
-    timeout: int = 10, tp_size: int = 1, sp_ulysses_size: int = 1, sp_ring_size: int = 1
+    timeout: int = 10, target_tp_size: int = 1, tp_size: int = 1, sp_ulysses_size: int = 1, sp_ring_size: int = 1
 ):
     """Initialize distributed training.
 
     Args:
         timeout(int): Timeout for collective communication in minutes
-        tp_size(int): The degree of tensor parallelism
+        target_tp_size(int): The degree of tensor parallelism of target model
+        tp_size(int): The degree of tensor parallelism of darft model
+        sp_ulysses_size(int): The degree of sequence parallelism of ulysses of draft model
+        sp_ring_size(int): The degree of sequence parallelism of ring of draft model
     """
     dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
     local_rank = dist.get_rank() % torch.cuda.device_count()
@@ -78,57 +100,198 @@ def init_distributed(
     print_with_rank(f"bind to device {local_rank}")
 
     world_size = dist.get_world_size()
-    dp_size = world_size // tp_size
-    assert (
-        world_size == tp_size * dp_size
-    ), f"world size must be divisible by tp size, now {world_size=}, {(tp_size * dp_size)=} "
+    rank = dist.get_rank()
 
-    device_mesh = dist.device_mesh.init_device_mesh(
-        "cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp")
+    target_dp_size = world_size // target_tp_size
+    assert (
+        world_size == target_tp_size * target_dp_size
+    ), (
+        f"world size must be divisible by target_tp_size, "
+        f"now {world_size=}, {target_tp_size=}, {target_dp_size=}"
     )
 
-    assert (
-        world_size % (sp_ulysses_size * sp_ring_size) == 0
-    ), f"World size ({world_size}) cannot be evenly divided by total SP size ({sp_ulysses_size*sp_ring_size})"
-
-    draft_dp_size = world_size // (sp_ulysses_size * sp_ring_size)
-    draft_device_mesh = dist.device_mesh.init_device_mesh(
+    # Create Target Model's device mesh: (dp, tp)
+    target_device_mesh = dist.device_mesh.init_device_mesh(
         "cuda",
-        (draft_dp_size, sp_ulysses_size * sp_ring_size),
-        mesh_dim_names=("draft_dp", "sp"),
+        (target_dp_size, target_tp_size),
+        mesh_dim_names=("target_dp", "target_tp"),
     )
-    set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, dist.get_rank(), world_size)
+    print_with_rank(f"Target device mesh: {target_device_mesh}")
 
-    print_with_rank(f"device mesh: {device_mesh}")
-    tp_group = device_mesh.get_group("tp")
-    dp_group = device_mesh.get_group("dp")
+    target_tp_group = target_device_mesh.get_group("target_tp")
+    target_dp_group = target_device_mesh.get_group("target_dp")
+    target_tp_device_mesh = dist.DeviceMesh.from_group(target_tp_group, device_type="cuda")
+    target_dp_device_mesh = dist.DeviceMesh.from_group(target_dp_group, device_type="cuda")
 
+    # ============================================================
+    # 2. Draft Model 并行配置（SP + TP + DP）
+    # ============================================================
+    total_draft_sp_size = sp_ulysses_size * sp_ring_size
+    
+    assert (
+        world_size % (total_draft_sp_size * tp_size) == 0
+    ), (
+        f"World size ({world_size}) cannot be evenly divided by "
+        f"draft_tp_size ({tp_size}) * total_sp_size ({total_draft_sp_size})"
+    )
+
+    draft_dp_size = world_size // (total_draft_sp_size * tp_size)
+    
+    # 创建Draft Model的device mesh: (draft_dp, draft_tp, sp) 或 (draft_dp, sp)
+    if tp_size > 1:
+        draft_device_mesh = dist.device_mesh.init_device_mesh(
+            "cuda",
+            (draft_dp_size, tp_size, total_draft_sp_size),
+            mesh_dim_names=("draft_dp", "draft_tp", "sp"),
+        )
+    else:
+        draft_device_mesh = dist.device_mesh.init_device_mesh(
+            "cuda",
+            (draft_dp_size, total_draft_sp_size),
+            mesh_dim_names=("draft_dp", "sp"),
+        )
+
+    print_with_rank(f"Draft device mesh: {draft_device_mesh}")
+
+    # 设置sequence parallelism进程组
+    set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, rank, world_size)
+
+    # 获取Draft Model的各个进程组
+    draft_dp_group = draft_device_mesh.get_group("draft_dp")
+    draft_sp_group = draft_device_mesh.get_group("sp")
+    draft_dp_device_mesh = dist.DeviceMesh.from_group(draft_dp_group, device_type="cuda")
+    
+    if tp_size > 1:
+        draft_tp_group = draft_device_mesh.get_group("draft_tp")
+        draft_tp_device_mesh = dist.DeviceMesh.from_group(draft_tp_group, device_type="cuda")
+    else:
+        draft_tp_group = None
+        draft_tp_device_mesh = None
+
+    # 获取SP进程组（来自PROCESS_GROUP模块）
     sp_ulysses_group = PROCESS_GROUP.ULYSSES_PG
     sp_ring_group = PROCESS_GROUP.RING_PG
-    # we need to create a 1D submesh
-    tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type="cuda")
 
-    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH, _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
-    _DEVICE_MESH = device_mesh
-    _TP_GROUP = tp_group
-    _TP_DEVICE_MESH = tp_device_mesh
+    # ============================================================
+    # 3. 计算并验证并行度配置
+    # ============================================================
+    print_with_rank("=" * 80)
+    print_with_rank("Distributed Parallelism Configuration:")
+    print_with_rank(f"  World Size: {world_size}")
+    print_with_rank(f"  Target Model:")
+    print_with_rank(f"    TP Size: {target_tp_size}, DP Size: {target_dp_size}")
+    print_with_rank(f"  Draft Model:")
+    print_with_rank(f"    TP Size: {tp_size}, DP Size: {draft_dp_size}")
+    print_with_rank(f"    SP (Ulysses x Ring): {sp_ulysses_size} x {sp_ring_size} = {total_draft_sp_size}")
+    print_with_rank(f"  Verification: {target_tp_size} * {target_dp_size} = {target_tp_size * target_dp_size}")
+    print_with_rank(f"  Verification: {tp_size} * {draft_dp_size} * {total_draft_sp_size} = {tp_size * draft_dp_size * total_draft_sp_size}")
+    print_with_rank("=" * 80)
+
+    # ============================================================
+    # 4. 全局变量设置
+    # ============================================================
+    global _TARGET_DEVICE_MESH, _TARGET_TP_GROUP,_TARGET_TP_DEVICE_MESH,_TARGET_DP_GROUP,_TARGET_DP_DEVICE_MESH,_DRAFT_DEVICE_MESH, \
+        _DRAFT_DP_GROUP,_DRAFT_DP_DEVICE_MESH,_DRAFT_TP_GROUP,_DRAFT_TP_DEVICE_MESH,_DRAFT_SP_GROUP,_SP_ULYSSES_GROUP,_SP_RING_GROUP
+
+    # Target Model 相关全局变量
+    _TARGET_DEVICE_MESH = target_device_mesh
+    _TARGET_TP_GROUP = target_tp_group
+    _TARGET_TP_DEVICE_MESH = target_tp_device_mesh
+    _TARGET_DP_GROUP = target_dp_group
+    _TARGET_DP_DEVICE_MESH = target_dp_device_mesh
+
+    # Draft Model 相关全局变量
+    _DRAFT_DEVICE_MESH = draft_device_mesh
+    _DRAFT_DP_GROUP = draft_dp_group
+    _DRAFT_DP_DEVICE_MESH = draft_dp_device_mesh
+    _DRAFT_TP_GROUP = draft_tp_group
+    _DRAFT_TP_DEVICE_MESH = draft_tp_device_mesh
+    _DRAFT_SP_GROUP = draft_sp_group
+
+    # Sequence Parallelism 相关全局变量
     _SP_ULYSSES_GROUP = sp_ulysses_group
     _SP_RING_GROUP = sp_ring_group
-    _DP_GROUP = dp_group
-    _DRAFT_DP_GROUP = draft_device_mesh.get_group("draft_dp")
-    _DRAFT_SP_GROUP = draft_device_mesh.get_group("sp")
-    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type="cuda")
+
+    print_with_rank("Distributed environment initialized successfully")
 
 
 def destroy_distributed():
-    global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP
-    dist.destroy_process_group(_TP_GROUP)
-    dist.destroy_process_group(_DP_GROUP)
-    dist.destroy_process_group(_SP_ULYSSES_GROUP)
-    dist.destroy_process_group(_SP_RING_GROUP)
-    dist.destroy_process_group(_DRAFT_DP_GROUP)
-    dist.destroy_process_group(_DRAFT_SP_GROUP)
-    dist.destroy_process_group()
+    global _TARGET_DEVICE_MESH,_TARGET_TP_GROUP,_TARGET_TP_DEVICE_MESH,_TARGET_DP_GROUP,_TARGET_DP_DEVICE_MESH,_DRAFT_DEVICE_MESH, \
+        _DRAFT_DP_GROUP,_DRAFT_DP_DEVICE_MESH,_DRAFT_TP_GROUP,_DRAFT_TP_DEVICE_MESH,_DRAFT_SP_GROUP,_SP_ULYSSES_GROUP,_SP_RING_GROUP
+
+    # 销毁Target Model相关进程组
+    if _TARGET_TP_GROUP is not None:
+        try:
+            dist.destroy_process_group(_TARGET_TP_GROUP)
+            print_with_rank("Destroyed target TP group")
+        except Exception as e:
+            print_with_rank(f"Warning: Failed to destroy target TP group: {e}")
+    
+    if _TARGET_DP_GROUP is not None:
+        try:
+            dist.destroy_process_group(_TARGET_DP_GROUP)
+            print_with_rank("Destroyed target DP group")
+        except Exception as e:
+            print_with_rank(f"Warning: Failed to destroy target DP group: {e}")
+
+    # 销毁Draft Model相关进程组
+    if _DRAFT_TP_GROUP is not None:
+        try:
+            dist.destroy_process_group(_DRAFT_TP_GROUP)
+            print_with_rank("Destroyed draft TP group")
+        except Exception as e:
+            print_with_rank(f"Warning: Failed to destroy draft TP group: {e}")
+    
+    if _DRAFT_DP_GROUP is not None:
+        try:
+            dist.destroy_process_group(_DRAFT_DP_GROUP)
+            print_with_rank("Destroyed draft DP group")
+        except Exception as e:
+            print_with_rank(f"Warning: Failed to destroy draft DP group: {e}")
+    
+    if _DRAFT_SP_GROUP is not None:
+        try:
+            dist.destroy_process_group(_DRAFT_SP_GROUP)
+            print_with_rank("Destroyed draft SP group")
+        except Exception as e:
+            print_with_rank(f"Warning: Failed to destroy draft SP group: {e}")
+
+    # 销毁Sequence Parallelism相关进程组
+    if _SP_ULYSSES_GROUP is not None:
+        try:
+            dist.destroy_process_group(_SP_ULYSSES_GROUP)
+            print_with_rank("Destroyed SP Ulysses group")
+        except Exception as e:
+            print_with_rank(f"Warning: Failed to destroy SP Ulysses group: {e}")
+    
+    if _SP_RING_GROUP is not None:
+        try:
+            dist.destroy_process_group(_SP_RING_GROUP)
+            print_with_rank("Destroyed SP Ring group")
+        except Exception as e:
+            print_with_rank(f"Warning: Failed to destroy SP Ring group: {e}")
+
+    # 重置全局变量
+    _TARGET_DEVICE_MESH = None
+    _TARGET_TP_GROUP = None
+    _TARGET_TP_DEVICE_MESH = None
+    _TARGET_DP_GROUP = None
+    _TARGET_DP_DEVICE_MESH = None
+    _DRAFT_DEVICE_MESH = None
+    _DRAFT_DP_GROUP = None
+    _DRAFT_DP_DEVICE_MESH = None
+    _DRAFT_TP_GROUP = None
+    _DRAFT_TP_DEVICE_MESH = None
+    _DRAFT_SP_GROUP = None
+    _SP_ULYSSES_GROUP = None
+    _SP_RING_GROUP = None
+
+    # 最后销毁默认进程组
+    try:
+        dist.destroy_process_group()
+        print_with_rank("Destroyed default process group")
+    except Exception as e:
+        print_with_rank(f"Warning: Failed to destroy default process group: {e}")
 
 
 def shard_tensor(
@@ -145,8 +308,8 @@ def gather_tensor(
     size = dist.get_world_size(process_group)
     obj_list = [torch.empty_like(tensor) for _ in range(size)]
     dist.all_gather(obj_list, tensor, group=process_group)
-    gather_tensor = torch.cat(obj_list, dim=dim)
-    return gather_tensor
+    gathered_tensor = torch.cat(obj_list, dim=dim)
+    return gathered_tensor
 
 
 def all_gather_tensor(

@@ -43,7 +43,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 from transformers.processing_utils import Unpack
 from transformers.utils import auto_docstring, can_return_tuple, logging
 
-from specforge.distributed import get_tp_group
+from specforge.distributed import get_target_tp_group
 from specforge.layers import (
     ColumnParallelLinear,
     ParallelLMHead,
@@ -69,7 +69,7 @@ class Qwen3MoeAttention(nn.Module):
         self.is_causal = True
 
         # Add TP support and head calculations
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
         self.tp_size = (
             dist.get_world_size(self.tp_group) if self.tp_group is not None else 1
         )
@@ -201,7 +201,7 @@ class Qwen3MoeMLP(nn.Module):
         )
 
         # Add TP support
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
         self.gate_proj = ColumnParallelLinear(
             self.hidden_size,
             self.intermediate_size,

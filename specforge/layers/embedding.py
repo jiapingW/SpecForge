@@ -6,7 +6,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from specforge.distributed import get_tp_group, shard_tensor
+from specforge.distributed import get_target_tp_group, shard_tensor
 
 
 class VocabParallelEmbedding(nn.Module):

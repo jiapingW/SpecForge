@@ -2,8 +2,9 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.autograd import Function
 
-from specforge.distributed import get_tp_group, shard_tensor
+from specforge.distributed import get_draft_tp_group, shard_tensor
 
 
 class RowParallelLinear(nn.Module):
@@ -20,7 +21,7 @@ class RowParallelLinear(nn.Module):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.layout_type = layout_type
-        self.tp_group = get_tp_group()
+        self.tp_group = get_draft_tp_group()
         self.tp_size = dist.get_world_size(self.tp_group)
         self.tp_rank = dist.get_rank(self.tp_group)
 
@@ -87,7 +88,7 @@ class ColumnParallelLinear(nn.Module):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.layout_type = layout_type
-        self.tp_group = get_tp_group()
+        self.tp_group = get_draft_tp_group()
         self.tp_size = dist.get_world_size(self.tp_group)
         self.tp_rank = dist.get_rank(self.tp_group)
 
@@ -202,3 +203,17 @@ class ColumnParallelLinear(nn.Module):
 
     def __repr__(self):
         return f"ColumnParallelLinear(in_features={self.in_features}, out_features={self.out_features_per_shard}, tp_size={self.tp_size}, tp_rank={self.tp_rank})"
+
+
+class _AllReduce(Function):
+    @staticmethod
+    def forward(ctx, input, op, group):
+        # ctx is a context object that can be used to stash information for backward computation
+        output = input.clone()
+        dist.all_reduce(output, op=op, group=group)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # # The gradient of all_reduce is an identity function, so we can directly return the gradient
+        return grad_output, None, None

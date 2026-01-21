@@ -51,7 +51,7 @@ from transformers.utils import (
 )
 
 # [MODIFIED] Import from distributed library
-from specforge.distributed import get_tp_group
+from specforge.distributed import get_target_tp_group
 from specforge.layers import (
     ColumnParallelLinear,
     ParallelLMHead,
@@ -70,7 +70,7 @@ class Qwen2MLP(nn.Module):
         self.intermediate_size = config.intermediate_size
 
         # distributed linear layers
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
         self.gate_proj = ColumnParallelLinear(
             self.hidden_size, self.intermediate_size, bias=False
         )
@@ -107,7 +107,7 @@ class Qwen2Attention(nn.Module):
         self.is_causal = True
 
         # distributed linear layers
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
         self.q_proj = ColumnParallelLinear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,

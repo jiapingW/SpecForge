@@ -33,10 +33,11 @@ from specforge.data import (
 )
 from specforge.distributed import (
     destroy_distributed,
-    get_dp_group,
+    get_target_dp_group,
     get_draft_dp_group,
     get_draft_sp_group,
-    get_tp_group,
+    get_target_tp_group,
+    get_draft_tp_group,
     init_distributed,
 )
 from specforge.modeling.target import (
@@ -44,6 +45,7 @@ from specforge.modeling.target import (
     TargetHead,
     get_eagle3_target_model,
 )
+from specforge.layers.lm_head import ParallelLMHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import Tracker, create_tracker, get_tracker_class
 from specforge.utils import (
@@ -55,7 +57,7 @@ from specforge.utils import (
     rank_0_priority,
     safe_conversations_generator,
 )
-
+import torch.nn.functional as F
 
 def parse_args() -> Tuple[ArgumentParser, Namespace]:
     """
@@ -161,18 +163,20 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
 
-    # data processing type
-    optimization_group = parser.add_argument_group("optimization")
-    optimization_group.add_argument(
-        "--tp-size",
+    # distributed training for target model
+    target_model_optimization_group = parser.add_argument_group("target_model_optimization")
+    target_model_optimization_group.add_argument(
+        "--target-tp-size",
         type=int,
         default=1,
         help="The size of the tensor parallel for the target model",
     )
-    # distributed training
-    optimization_group.add_argument("--sp-ulysses-size", type=int, default=1)
-    optimization_group.add_argument("--sp-ring-size", type=int, default=1)
-    optimization_group.add_argument(
+    # distributed training for draft model
+    draft_model_optimization_group = parser.add_argument_group("draft_model_optimization")
+    draft_model_optimization_group.add_argument("--tp-size", type=int, default=1)
+    draft_model_optimization_group.add_argument("--sp-ulysses-size", type=int, default=1)
+    draft_model_optimization_group.add_argument("--sp-ring-size", type=int, default=1)
+    draft_model_optimization_group.add_argument(
         "--attention-backend",
         type=str,
         default="flex_attention",
@@ -263,7 +267,7 @@ def build_target_model(
         if (
             args.is_vlm
             and draft_model_config.target_model_type == "qwen2_5_vl"
-            and args.tp_size == 1
+            and args.target_tp_size == 1
         ):
             from transformers import Qwen2_5_VLForConditionalGeneration
 
@@ -313,7 +317,7 @@ def build_target_model(
 
         return target_model, processor
     else:
-        target_head = TargetHead.from_pretrained(
+        target_head = ParallelLMHead.from_pretrained(
             model_path=args.target_model_path,
             lm_head_key=args.lm_head_key,
             cache_dir=args.model_download_dir,
@@ -332,8 +336,8 @@ def sanity_check(args: Namespace) -> None:
     Returns:
         None
     """
-    args.dp_size = dist.get_world_size() // args.tp_size
-    args.target_batch_size = args.tp_size * args.batch_size
+    args.target_dp_size = dist.get_world_size() // args.target_tp_size
+    args.target_batch_size = args.target_tp_size * args.batch_size
     args.draft_accumulation_steps = (
         args.draft_accumulation_steps * args.sp_ulysses_size * args.sp_ring_size
     )
@@ -449,7 +453,7 @@ def build_dataloaders(
         process_group=(
             get_draft_dp_group()
             if args.attention_backend == "usp" and not is_online
-            else get_dp_group()
+            else get_target_dp_group()
         ),
         is_vlm=args.is_vlm,
     )
@@ -483,7 +487,7 @@ def build_dataloaders(
             process_group=(
                 get_draft_dp_group()
                 if args.attention_backend == "usp" and not is_online
-                else get_dp_group()
+                else get_target_dp_group()
             ),
             is_vlm=args.is_vlm,
         )
@@ -562,19 +566,22 @@ def run_forward(
                 attention_mask=data["attention_mask"].cuda(),
                 loss_mask=data["loss_mask"].cuda(),
             )
-
-            input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
-            attention_mask = get_dp_data_shard_from_tp(eagle3_data.attention_mask)
-            loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
-            target = get_dp_data_shard_from_tp(eagle3_data.target)
-            hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+            input_ids = split_sequence_for_sp(split_batch_for_dp(eagle3_data.input_ids))
+            attention_mask = split_sequence_for_sp(
+                split_batch_for_dp(eagle3_data.attention_mask)
+            )
+            loss_mask = split_sequence_for_sp(split_batch_for_dp(eagle3_data.loss_mask))
+            target = split_sequence_for_sp(split_batch_for_dp(eagle3_data.target))
+            hidden_states = split_sequence_for_sp(split_batch_for_dp(eagle3_data.hidden_states))
         else:
+            from forkedpdb import ForkedPdb
+            ForkedPdb().set_trace()
             # we generate the logits using the hidden states loaded from disk
-            input_ids = data["input_ids"].cuda()
-            attention_mask = data["attention_mask"].cuda()
-            loss_mask = data["loss_mask"].cuda()
-            hidden_states = data["hidden_state"].cuda()
-            target = target_model(data["target"].cuda())
+            input_ids = split_sequence_for_sp(data["input_ids"].cuda())
+            attention_mask = split_sequence_for_sp(data["attention_mask"].cuda())
+            loss_mask = split_sequence_for_sp(data["loss_mask"].cuda())
+            hidden_states = split_sequence_for_sp(data["hidden_state"].cuda())
+            target = split_sequence_for_sp(target_model(data["target"].cuda()))
             input_ids, target, loss_mask = target_model.preprocess(
                 input_ids, target, loss_mask
             )
@@ -639,57 +646,92 @@ def record_metrcs(
     tracker.log(logdict, step=global_step)
 
 
-def get_dp_data_shard_from_tp(tensor: torch.Tensor, sp_dim: int = 1) -> torch.Tensor:
+def split_batch_for_dp(tensor: torch.Tensor):
     """
-    Process: TP split -> Pad to Max Len -> SP gather.
+    Online 模式专用：将 Target 模型产生的全量 Batch 切分给 Draft 的各个副本
     """
-    # 1. TP: Slice the tensor along the batch dimension
-    tp_group = get_tp_group()
-    tp_size = dist.get_world_size(tp_group)
-    tp_rank = dist.get_rank(tp_group)
+    dp_size = dist.get_world_size(get_draft_dp_group()) if get_draft_dp_group() else 1
+    dp_rank = dist.get_rank(get_draft_dp_group()) if get_draft_dp_group() else 0
+    
+    if dp_size > 1:
+        # 确保 Batch 维度可以被 dp_size 整除
+        return tensor.chunk(dp_size, dim=0)[dp_rank]
+    return tensor
 
-    local_tp_shard = tensor.chunk(tp_size, dim=0)[tp_rank]
+def split_sequence_for_sp(tensor: torch.Tensor, sp_dim=1):
+    """
+    通用：将当前卡负责的 Batch 进一步切分序列
+    """
+    sp_size = dist.get_world_size(get_draft_sp_group()) if get_draft_sp_group() else 1
+    sp_rank = dist.get_rank(get_draft_sp_group()) if get_draft_sp_group() else 0
+    
+    if sp_size > 1:
+        seq_len = tensor.size(sp_dim)
+        # 填充逻辑 (Padding)
+        if seq_len % sp_size != 0:
+            padding_size = sp_size - (seq_len % sp_size)
+            # 动态构建 pad_config
+            pad_config = [0] * (tensor.ndim * 2)
+            # 对应 sp_dim 的右侧填充
+            rev_idx = (tensor.ndim - 1 - sp_dim) * 2 + 1
+            pad_config[rev_idx] = padding_size
+            tensor = F.pad(tensor, pad_config, value=0)
+            
+        return tensor.chunk(sp_size, dim=sp_dim)[sp_rank]
+    return tensor
 
-    # 2. SP: Handle dynamic sequence lengths and Gather
-    sp_group = get_draft_sp_group()
 
-    if sp_group is not None and dist.get_world_size(sp_group) > 1:
-        sp_world_size = dist.get_world_size(sp_group)
-        local_seq_len = local_tp_shard.size(sp_dim)
 
-        # Find global max sequence length in SP group
-        len_tensor = torch.tensor(
-            [local_seq_len], device=local_tp_shard.device, dtype=torch.long
-        )
-        dist.all_reduce(len_tensor, op=dist.ReduceOp.MAX, group=sp_group)
-        max_seq_len = len_tensor.item()
+# def get_dp_data_shard_from_tp(tensor: torch.Tensor, sp_dim: int = 1) -> torch.Tensor:
+#     """
+#     Process: TP split -> Pad to Max Len -> SP gather.
+#     """
+#     # 1. TP: Slice the tensor along the batch dimension of target model forward
+#     tp_group = get_target_tp_group()
+#     tp_size = dist.get_world_size(tp_group)
+#     tp_rank = dist.get_rank(tp_group)
 
-        # Pad local tensor if necessary
-        # Shape is [Batch, Seq, Hidden] or [Batch, Seq], and sp_dim=1
-        if local_seq_len < max_seq_len:
-            pad_size = max_seq_len - local_seq_len
+#     local_tp_shard = tensor.chunk(tp_size, dim=0)[tp_rank]
 
-            pad_config = [0] * (local_tp_shard.ndim * 2)
+#     # 2. SP: Handle dynamic sequence lengths and Gather
+#     sp_group = get_draft_sp_group()
 
-            pad_idx = (local_tp_shard.ndim - 1 - sp_dim) * 2 + 1
-            pad_config[pad_idx] = pad_size
+#     if sp_group is not None and dist.get_world_size(sp_group) > 1:
+#         sp_world_size = dist.get_world_size(sp_group)
+#         local_seq_len = local_tp_shard.size(sp_dim)
 
-            # Pad value: 0 is standard, ensure it matches your pad_token_id logic if needed
-            local_tp_shard_padded = nn.F.pad(local_tp_shard, pad_config, value=0)
-        else:
-            local_tp_shard_padded = local_tp_shard
+#         # Find global max sequence length in SP group
+#         len_tensor = torch.tensor(
+#             [local_seq_len], device=local_tp_shard.device, dtype=torch.long
+#         )
+#         dist.all_reduce(len_tensor, op=dist.ReduceOp.MAX, group=sp_group)
+#         max_seq_len = len_tensor.item()
 
-        gathered_shards = [
-            torch.empty_like(local_tp_shard_padded) for _ in range(sp_world_size)
-        ]
-        dist.all_gather(
-            gathered_shards, local_tp_shard_padded.contiguous(), group=sp_group
-        )
+#         # Pad local tensor if necessary
+#         # Shape is [Batch, Seq, Hidden] or [Batch, Seq], and sp_dim=1
+#         if local_seq_len < max_seq_len:
+#             pad_size = max_seq_len - local_seq_len
 
-        return torch.cat(gathered_shards, dim=sp_dim)
+#             pad_config = [0] * (local_tp_shard.ndim * 2)
 
-    return local_tp_shard
+#             pad_idx = (local_tp_shard.ndim - 1 - sp_dim) * 2 + 1
+#             pad_config[pad_idx] = pad_size
 
+#             # Pad value: 0 is standard, ensure it matches your pad_token_id logic if needed
+#             local_tp_shard_padded = nn.F.pad(local_tp_shard, pad_config, value=0)
+#         else:
+#             local_tp_shard_padded = local_tp_shard
+
+#         gathered_shards = [
+#             torch.empty_like(local_tp_shard_padded) for _ in range(sp_world_size)
+#         ]
+#         dist.all_gather(
+#             gathered_shards, local_tp_shard_padded.contiguous(), group=sp_group
+#         )
+
+#         return torch.cat(gathered_shards, dim=sp_dim)
+
+#     return local_tp_shard
 
 def main():
     # ================================================
@@ -699,6 +741,7 @@ def main():
     set_seed(args.seed)
     init_distributed(
         timeout=args.dist_timeout,
+        target_tp_size=args.target_tp_size,
         tp_size=args.tp_size,
         sp_ring_size=args.sp_ring_size,
         sp_ulysses_size=args.sp_ulysses_size,
@@ -716,14 +759,12 @@ def main():
     # ================================================
     draft_model_config, draft_model = build_draft_model(args)
     target_model, processor = build_target_model(args, draft_model_config, is_online)
-
     # ================================================
     # 3. Build dataloader
     # ================================================
     train_dataloader, vocab_mapping_path, eval_dataloader = build_dataloaders(
         args, draft_model_config, processor
     )
-
     # we load the vocab mapping then
     draft_model.load_vocab_mapping(vocab_mapping_path)
     print_with_rank("Loaded vocab mapping")
@@ -799,7 +840,8 @@ def main():
     # 7. Start training
     # ================================================
     print_on_rank0(f"Starting training from epoch {start_epoch}")
-
+    from forkedpdb import ForkedPdb
+    # ForkedPdb().set_trace()
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)

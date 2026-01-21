@@ -76,12 +76,14 @@ class TargetHead(nn.Module):
             state_dict = torch.load(os.path.join(self.model_path, ckpt_file))
             lm_head = state_dict[lm_head_key]
         self.fc.weight.copy_(lm_head)
+        print("weight:", self.fc.weight.shape)
 
     def freeze_weights(self):
         for param in self.fc.parameters():
             param.requires_grad = False
 
     def forward(self, hidden_states):
+        print("Input hidden states shape:", hidden_states.shape, self.fc.weight.shape)
         return self.fc(hidden_states)
 
     def preprocess(self, input_ids, target, loss_mask):

@@ -45,7 +45,7 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 
-from specforge.distributed import get_tp_group
+from specforge.distributed import get_target_tp_group
 from specforge.layers import (
     ColumnParallelLinear,
     ParallelLMHead,
@@ -61,7 +61,7 @@ class Phi3MLP(nn.Module):
         self.config = config
 
         # Add TP support
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
 
         self.gate_up_proj = ColumnParallelLinear(
             config.hidden_size,
@@ -105,7 +105,7 @@ class Phi3Attention(nn.Module):
         self.is_causal = True
 
         # Add TP support
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
         tp_size = dist.get_world_size(self.tp_group)
 
         # Adjust head counts for TP

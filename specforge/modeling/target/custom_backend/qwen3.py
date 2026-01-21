@@ -42,7 +42,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from transformers.processing_utils import Unpack
 from transformers.utils import auto_docstring, can_return_tuple, logging
 
-from specforge.distributed import get_tp_group
+from specforge.distributed import get_target_tp_group
 from specforge.layers import (
     ColumnParallelLinear,
     ParallelLMHead,
@@ -61,7 +61,7 @@ class Qwen3MLP(nn.Module):
         self.intermediate_size = config.intermediate_size
 
         # Add TP support
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
 
         self.gate_proj = ColumnParallelLinear(
             self.hidden_size, self.intermediate_size, bias=False
@@ -100,7 +100,7 @@ class Qwen3Attention(nn.Module):
         self.is_causal = True
 
         # Add TP support
-        self.tp_group = get_tp_group()
+        self.tp_group = get_target_tp_group()
 
         self.q_proj = ColumnParallelLinear(
             config.hidden_size,

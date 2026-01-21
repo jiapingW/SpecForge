@@ -1,13 +1,19 @@
 import math
 from typing import Optional
+import json
+import os
+import glob
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from safetensors import safe_open
+from transformers import AutoConfig
+from huggingface_hub import snapshot_download
 
-from specforge.distributed import get_tp_group, shard_tensor
-
+from specforge.distributed import get_draft_tp_group, shard_tensor
+from specforge.utils import padding
 
 class ParallelLMHead(nn.Module):
 
@@ -24,7 +30,7 @@ class ParallelLMHead(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         self.in_features = in_features
         self.out_features = out_features
-        self.tp_group = get_tp_group()
+        self.tp_group = get_draft_tp_group()
         self.tp_size = dist.get_world_size(self.tp_group)
         self.tp_rank = dist.get_rank(self.tp_group)
 
@@ -52,6 +58,59 @@ class ParallelLMHead(nn.Module):
 
         # handle weight loading
         self._register_load_state_dict_pre_hook(self.shard_state_dict)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_path: str,
+        lm_head_key: str = "lm_head.weight",
+        cache_dir: Optional[str] = None,
+        trust_remote_code: bool = False,
+    ) -> "ParallelLMHead":
+        # 1. 加载配置获取维度
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+        
+        # 2. 实例化对象 (此时会在各卡创建空的 Parameter)
+        instance = cls(
+            in_features=config.hidden_size,
+            out_features=config.vocab_size,
+            bias=False, # 大多数开源模型如 Llama/Qwen 为 False
+            dtype=torch.bfloat16
+        )
+
+        # 3. 权重定位与加载 (仅在主进程读取磁盘，或者各卡并行读取以减少通信)
+        # 这里沿用 TargetHead 的逻辑定位权重文件
+        if not os.path.exists(model_path):
+            actual_model_path = snapshot_download(repo_id=model_path, cache_dir=cache_dir)
+        else:
+            actual_model_path = model_path
+
+        # 找到 index.json
+        index_files = glob.glob(os.path.join(actual_model_path, "*.index.json"))
+        if not index_files:
+            raise FileNotFoundError(f"No index.json found in {actual_model_path}")
+        
+        with open(index_files[0], "r") as f:
+            index_json = json.load(f)
+        
+        ckpt_file = index_json["weight_map"][lm_head_key]
+        full_ckpt_path = os.path.join(actual_model_path, ckpt_file)
+
+        # 4. 读取完整权重 (此处由于后续 Hook 会 shard，所以需要加载完整的权重字典)
+        if full_ckpt_path.endswith(".safetensors"):
+            with safe_open(full_ckpt_path, framework="pt") as f:
+                full_weight = f.get_tensor(lm_head_key)
+        else:
+            state_dict = torch.load(full_ckpt_path, map_location="cpu")
+            full_weight = state_dict[lm_head_key]
+
+        # 5. 调用 load_state_dict，触发 shard_state_dict hook
+        # 注意：这里构造的 key 要对应 self.weight 的变量名 "weight"
+        instance.load_state_dict({"weight": full_weight}, strict=False)
+        
+        # 6. 移动到设备并设为 eval 模式
+        instance = instance.cuda().eval()
+        return instance
 
     def shard_state_dict(self, state_dict, *args):
         if "weight" in state_dict:
@@ -107,3 +166,33 @@ class ParallelLMHead(nn.Module):
 
     def __repr__(self):
         return f"ParallelLMHead(in_features={self.in_features}, out_features={self.out_features_per_shard}, tp_size={self.tp_size}, tp_rank={self.tp_rank})"
+
+
+    def preprocess(self, input_ids, target, loss_mask):
+        """
+        对输入数据进行预处理。
+        
+        参数:
+            input_ids: 原始输入 ID (通常是 List[List[int]] 或未对齐的 Tensor)
+            target: 目标 Label (通常是 List[List[int]])
+            loss_mask: 损失掩码 [Batch, SeqLen]
+            
+        返回:
+            处理后的 input_ids, target, loss_mask (均为 Tensor)
+        """
+        # 1. 应用 Padding (调用你提供的 padding 工具函数)
+        # 在 TP 环境下，padding 必须确保在所有 Rank 上产生的 Max Length 是一致的
+        target = padding(target, left=False)
+        input_ids = padding(input_ids, left=False)
+
+        # 2. 调整 loss_mask 的维度
+        # 从 [Batch, SeqLen] 变为 [Batch, SeqLen, 1]
+        # 这样做是为了后续方便与 Logits [Batch, SeqLen, local_vocab] 进行广播乘法
+        if isinstance(loss_mask, torch.Tensor):
+            loss_mask = loss_mask[..., None]
+            loss_mask = loss_mask.to(target.device)
+        else:
+            # 如果 loss_mask 还是 list，先转 tensor
+            loss_mask = torch.tensor(loss_mask, device=target.device)[..., None]
+
+        return input_ids, target, loss_mask

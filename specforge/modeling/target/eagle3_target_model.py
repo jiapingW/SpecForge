@@ -17,7 +17,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from transformers import AutoModelForCausalLM
 
-from specforge.distributed import get_tp_device_mesh, get_tp_group
+from specforge.distributed import get_target_tp_device_mesh, get_target_tp_group
 from specforge.utils import padding
 
 from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
@@ -112,13 +112,13 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         """
         Initialize the HuggingFace target model backend from a pretrained model path.
         """
-        tp_size = get_tp_group().size()
+        tp_size = get_target_tp_group().size()
 
         if tp_size > 1:
             device_kwargs = {
                 "tp_plan": "auto",
                 "tp_size": tp_size,
-                "device_mesh": get_tp_device_mesh(),
+                "device_mesh": get_target_tp_device_mesh(),
             }
         else:
             device_kwargs = {
@@ -255,7 +255,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         trust_remote_code: bool = False,
         **kwargs,
     ) -> "SGLangEagle3TargetModel":
-        tp_size = dist.get_world_size(get_tp_group())
+        tp_size = dist.get_world_size(get_draft_tp_group())
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
@@ -267,14 +267,14 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             **kwargs,
         )
 
-        tp_rank = dist.get_rank(get_tp_group())
+        tp_rank = dist.get_rank(get_draft_tp_group())
         moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
         model_config = ModelConfig.from_server_args(server_args)
         model_runner = SGLangRunner(
             model_config=model_config,
             mem_fraction_static=server_args.mem_fraction_static,
             gpu_id=torch.cuda.current_device(),
-            tp_rank=dist.get_rank(get_tp_group()),
+            tp_rank=dist.get_rank(get_draft_tp_group()),
             tp_size=server_args.tp_size,
             moe_ep_rank=moe_ep_rank,
             moe_ep_size=server_args.ep_size,

@@ -8,8 +8,8 @@ export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 
 # export TOKENIZERS_PARALLELISM=false
 
-NUM_GPUS=8
-TP_SIZE=2
+NUM_GPUS=4
+TP_SIZE=1
 
 TARGET_MODEL_PATH=/disk3/wjp/pretrained_models/Qwen3-Coder-30B-A3B-Instruct
 TRAIN_DATA_PATH=/disk3/wjp/datasets/repowiki/data_for_SpecForge_test.jsonl
@@ -57,12 +57,12 @@ torchrun \
     --chat-template repo-wiki \
     --cache-dir $ROOT_DIR/cache \
     --embedding-key model.embed_tokens.weight \
-    --tp-size 1 \
+    --tp-size 2 \
     --report-to tensorboard \
     --save-interval $LOR_INTERNAL \
     --log-interval $SAVE_INTERNAL \
-    --sp-ring-size 2 \
-    --sp-ulysses-size 4 \
+    --sp-ring-size 1 \
+    --sp-ulysses-size 2 \
     --attention-backend usp
 
 
@@ -79,14 +79,15 @@ torchrun \
 #     --num-epochs 10 \
 #     --batch-size 1 \
 #     --learning-rate 1e-4 \
-#     --max-length 32768 \
+#     --max-length 65536 \
 #     --chat-template repo-wiki \
 #     --cache-dir $ROOT_DIR/cache \
 #     --embedding-key model.embed_tokens.weight \
-#     --tp-size 1 \
+#     --tp-size 4 \
 #     --report-to tensorboard \
 #     --save-interval $LOR_INTERNAL \
 #     --log-interval $SAVE_INTERNAL \
-#     --sp-ring-size 2 \
-#     --sp-ulysses-size 4 \
-#     --attention-backend usp
+#     --sp-ring-size 4 \
+#     --sp-ulysses-size 1 \
+#     --attention-backend usp \
+#     --target-model-backend hf
