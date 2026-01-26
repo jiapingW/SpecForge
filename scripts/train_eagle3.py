@@ -340,9 +340,24 @@ def sanity_check(args: Namespace) -> None:
     """
     args.dp_size = dist.get_world_size() // args.tp_size
     args.target_batch_size = args.tp_size * args.batch_size
+    if args.attention_backend == "usp":
+        sp_sanity_check(args)
+
+
+def sp_sanity_check(args: Namespace) -> None:
     args.draft_accumulation_steps = (
         args.draft_accumulation_steps * args.sp_ulysses_size * args.sp_ring_size
     )
+    assert (
+        args.batch_size == 1
+    ), f"USP only supports batch_size=1, got batch_size={args.batch_size}"
+
+    assert args.sp_ring_size * args.sp_ulysses_size > 1, (
+        f"USP requires sp_ring_size * sp_ulysses_size > 1. "
+        f"Got sp_ring_size={args.sp_ring_size}, sp_ulysses_size={args.sp_ulysses_size}."
+    )
+
+    assert args.train_hidden_states_path is not None, f"USP only support offline mode"
 
     if args.eval_data_path is not None and args.eval_hidden_states_path is not None:
         raise ValueError(
@@ -453,6 +468,8 @@ def build_dataloaders(
             train_eagle3_dataset = build_offline_eagle3_dataset(
                 args.train_hidden_states_path,
                 args.max_length,
+                ttt_length=args.ttt_length,
+                use_usp_preprocess=(args.attention_backend == "usp"),
             )
 
     train_dataloader = prepare_dp_dataloaders(
@@ -488,6 +505,8 @@ def build_dataloaders(
             eval_eagle3_dataset = build_offline_eagle3_dataset(
                 args.eval_hidden_states_path,
                 args.max_length,
+                ttt_length=args.ttt_length,
+                use_usp_preprocess=(args.attention_backend == "usp"),
             )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
@@ -619,6 +638,9 @@ def run_forward(
             loss_mask=loss_mask,
             target=target,
             hidden_states=hidden_states,
+            position_ids=(
+                data["position_ids"].cuda() if "position_ids" in data else None
+            ),
             image_grid_thw=image_grid_thw,
             is_vlm=args.is_vlm,
         )
@@ -890,7 +912,11 @@ def main():
             # 7.1 Training Step
             # ================================================
             plosses, acces = run_forward(
-                args, eagle3_model, data, target_model, is_online
+                args,
+                eagle3_model,
+                data,
+                target_model,
+                is_online,
             )
             run_backward_and_update(args, plosses, optimizer, global_step)
 
