@@ -102,7 +102,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-@torch.compile(dynamic=True)
+# @torch.compile(dynamic=True)
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
     cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
@@ -1049,13 +1049,15 @@ class LlamaUSPFlashAttention(LlamaAttention):
         # =============================================================
         if self.sp_ring_degree > 1:
             if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
-                position_ids = position_ids.chunk(self.sp_ring_degree, dim=2)[
-                    self.ring_rank
-                ].clone()
+                if position_ids.shape[2] != q_len:
+                    position_ids = position_ids.chunk(self.sp_ring_degree, dim=2)[
+                        self.ring_rank
+                    ].clone()
             else:
-                position_ids = position_ids.chunk(self.sp_ring_degree, dim=1)[
-                    self.ring_rank
-                ].clone()
+                if position_ids.shape[1] != q_len:
+                    position_ids = position_ids.chunk(self.sp_ring_degree, dim=1)[
+                        self.ring_rank
+                    ].clone()
 
         lck = 0 if cache_hidden is None else len(cache_hidden[0])
 
@@ -1430,12 +1432,15 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self,
         input_embeds: torch.Tensor,
         hidden_states: torch.Tensor,
-        cache_hidden: torch.Tensor,
+        cache_hidden: torch.Tensor,  # 注意：在训练loop中这里可能是List，checkpoint可以处理
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
-        past_key_values: Optional[Cache] = None,
+        past_key_values: Optional[tuple] = None, # 原类型提示是Cache，这里泛化一下
         use_cache: bool = True,
     ) -> torch.Tensor:
+        """
+        支持 Gradient Checkpointing 的 backbone 前向传播。
+        """
         return self.midlayer(
             input_emb=input_embeds,
             hidden_states=hidden_states,
@@ -1444,5 +1449,5 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             position_ids=position_ids,
             past_key_values=past_key_values,
             output_attentions=False,
-            use_cache=False,
+            use_cache=False, # 这里的 use_cache 对应 midlayer 的参数，原代码硬编码为 False
         )

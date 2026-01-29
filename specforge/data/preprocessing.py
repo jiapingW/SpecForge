@@ -22,6 +22,7 @@
 
 import os
 import re
+import torch.nn.functional as F
 import warnings
 from collections import Counter
 from typing import Dict, List, Optional, Tuple, Union
@@ -29,7 +30,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from tqdm import tqdm
 from transformers import ImageProcessingMixin, PreTrainedTokenizer
-
+from ..distributed import get_draft_sp_group
 from datasets import Dataset as HFDataset
 
 try:
@@ -449,32 +450,155 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         self.transform = transform
         self._epoch = 0
         self.max_len = max_len
+        sp_group = get_draft_sp_group()
+        if sp_group:
+            self.sp_rank = torch.distributed.get_rank(sp_group)
+            self.sp_size = torch.distributed.get_world_size(sp_group)
+        else:
+            self.sp_rank = 0
+            self.sp_size = 1
+
+    def _open_file(self, index):
+        """
+        Opens the file with memory mapping.
+        This operation is virtually instant and consumes negligible RAM
+        because no data is actually read from disk yet.
+        """
+        return torch.load(self.datapaths[index], weights_only=False, mmap=True)
 
     @staticmethod
-    def process_data(data, max_len, transform=None):
+    def process_data(data, max_len, transform=None, sp_rank=0, sp_size=1):
+        """
+        Static method to process data with mixed sharding strategy.
+        - Hidden States: Sharded by sp_rank (to save VRAM/RAM).
+        - Input IDs/Masks: Kept full length (for context/positional embeddings).
+        """
         new_data = {}
-        # Squeeze due to our data generation script adding a batch dimension
-        hidden_state = data["aux_hidden_state"].squeeze(0)[:max_len][None, :]
-        target = data["hidden_state"].squeeze(0)[:max_len][None, :]
 
-        input_ids = data["input_ids"][:max_len][None, :]
-        loss_mask = data["loss_mask"][:max_len][None, :]
-        loss_mask[0, -1] = 0
+        # -------------------------------------------------------
+        # Helper 1: Get Sharded Chunk (for heavy hidden states)
+        # -------------------------------------------------------
+        def get_sharded_sequence(tensor):
+            """
+            对 1D/2D/3D 张量按 Sequence Parallelism (SP) 切分序列维度。
+            
+            Args:
+                tensor: 输入张量
+                    - 1D: [L]
+                    - 2D: [B, L]
+                    - 3D: [B, L, H]
+                sp_size (int): SP 并行度
+                sp_rank (int): 当前 rank 在 SP 组中的编号
+                max_len (int, optional): 最大序列长度，用于截断
+            
+            Returns:
+                张量：仅包含当前 SP rank 负责的序列片段
+            """
+            original_shape = tensor.shape
 
-        new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
-        new_data["loss_mask"] = loss_mask
-        new_data["target"] = target
-        new_data["hidden_state"] = hidden_state
-        new_data["input_ids"] = input_ids
+            # === Step 1: 校验并确定序列维度 ===
+            if tensor.ndim == 1:
+                tensor = tensor.unsqueeze(0)
+            if tensor.ndim == 2:
+                seq_dim = 1
+                batch_dim = 0
+            elif tensor.ndim == 3:
+                seq_dim = 1
+                batch_dim = 0
+            else:
+                raise ValueError(f"Unsupported tensor ndim: {tensor.ndim}. Expected 1, 2, or 3.")
+
+            # === Step 2: 截断到 max_len（如果指定）===
+            if max_len is not None and tensor.size(seq_dim) > max_len:
+                slices = [slice(None)] * tensor.ndim
+                slices[seq_dim] = slice(None, max_len)
+                tensor = tensor[tuple(slices)]
+
+            # === Step 3: SP 切分（仅当 sp_size > 1）===
+            if sp_size > 1:
+                global_len = tensor.size(seq_dim)
+                chunk_size = (global_len + sp_size - 1) // sp_size  # ceil division
+                padded_len = chunk_size * sp_size
+
+                # 如果需要 padding
+                if padded_len > global_len:
+                    pad_len = padded_len - global_len
+                    # 构造 padding 配置：F.pad 的格式是 (..., left, right, ..., top, bottom)
+                    # 对于任意维度，我们只在 seq_dim 的末尾补 0
+                    pad_config = [0] * (2 * tensor.ndim)
+                    # seq_dim 从右往左数的位置：例如 dim=1 in 3D → index = -2
+                    pad_index = -(2 * (tensor.ndim - seq_dim - 1) + 1)  # 计算 right padding 位置
+                    pad_config[pad_index] = pad_len
+                    tensor = F.pad(tensor, tuple(pad_config))
+
+                # 沿 seq_dim 切分，并取当前 rank 的 chunk
+                chunks = torch.chunk(tensor, chunks=sp_size, dim=seq_dim)
+                # 如果 global_len 不足 sp_size * chunk_size，最后一个 chunk 可能更小，但 torch.chunk 已处理
+                tensor = chunks[sp_rank]
+
+            # === Step 4: 确保内存连续（触发 mmap 加载）===
+            return tensor.contiguous()
+
+        # -------------------------------------------------------
+        # Helper 2: Get Full Sequence (for lightweight inputs)
+        # -------------------------------------------------------
+        def get_full_sequence(tensor):
+            # Keep batch dim for DataCollator (expects [1, Seq, ...])
+            if tensor.ndim == 1:
+                tensor = tensor.unsqueeze(0)
+            if tensor.size(0) != 1:
+                raise ValueError(
+                    f"Expected batch=1 for sequence data, got shape {tuple(tensor.shape)}"
+                )
+
+            # Only truncate, do not shard
+            tensor = tensor[:, :max_len]
+
+            # Trigger actual Disk I/O
+            return tensor.contiguous()
+
+        # --- A. Heavy Tensors: Apply SP Sharding ---
+        # Data shape: [Batch, Seq, Hidden] -> [Seq/sp_size, Hidden]
+        if "aux_hidden_state" not in data or data["aux_hidden_state"] is None:
+            raise KeyError("aux_hidden_state is required for OfflineEagle3Dataset")
+        from .forkedpdb import ForkedPdb
+        # ForkedPdb().set_trace()
+        new_data["hidden_state"] = get_sharded_sequence(data["aux_hidden_state"])
+        # --- B. Target Hidden States: Keep Full Sequence ---
+        # Data shape: [Batch, Seq, Hidden] -> [Seq, Hidden]
+        new_data["target"] = get_sharded_sequence(data["hidden_state"])
+
+        # --- C. Light Tensors: Keep Full Sequence ---
+        # Data shape: [Batch, Seq] -> [Seq]
+        new_data["input_ids"] = get_sharded_sequence(data["input_ids"])
+
+        # --- D. Loss Mask Handling ---
+        # We need the full mask, but need to ensure the very last token is ignored
+        full_loss_mask = data["loss_mask"]
+        if full_loss_mask.ndim == 1:
+            full_loss_mask = full_loss_mask.unsqueeze(0)
+        if full_loss_mask.size(0) != 1:
+            raise ValueError(
+                f"Expected batch=1 for loss_mask, got shape {tuple(full_loss_mask.shape)}"
+            )
+
+        # Slice and clone to ensure we can modify it safely without affecting mmap source
+        full_loss_mask = full_loss_mask[:, :max_len].clone()
+
+        # Mask out the last token of the global sequence
+        if full_loss_mask.numel() > 0:
+            full_loss_mask[0, -1] = 0
+
+        new_data["loss_mask"] = get_sharded_sequence(full_loss_mask.contiguous())
+
+        # Generate Attention Mask (Full Length)
+        new_data["attention_mask"] = torch.ones_like(
+            new_data["loss_mask"], dtype=torch.long
+        )
         if transform:
             new_data = transform(new_data)
         return new_data
 
-    def __len__(self):
-        return len(self.datapaths)
-
-    def _open_file(self, index):
-        return torch.load(self.datapaths[index], weights_only=False)
 
     def __getitem__(self, index):
         try:
@@ -482,7 +606,16 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         except Exception as e:
             print(f"ERROR Failed to load {self.datapaths[index]} with error {e}")
             data = self._open_file(0)
-        return self.process_data(data, self.max_len, self.transform)
+        return self.process_data(
+            data,
+            self.max_len,
+            self.transform,
+            sp_rank=self.sp_rank,
+            sp_size=self.sp_size,
+        )
+
+    def __len__(self):
+        return len(self.datapaths)
 
     def set_epoch(self, epoch):
         self._epoch = epoch

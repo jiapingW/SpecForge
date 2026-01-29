@@ -21,7 +21,7 @@
 # limitations under the License.
 
 from typing import List, Optional, Tuple
-
+import torch.distributed as dist
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,9 +34,10 @@ from specforge.distributed import (
     gather_outputs_and_unpad,
     get_sp_ring_group,
     get_sp_ulysses_group,
+    get_draft_sp_group,
 )
 from specforge.modeling.draft import Eagle3DraftModel
-from specforge.utils import padding
+from specforge.utils import padding, sp_padding
 
 
 class Eagle3Model(nn.Module):
@@ -83,7 +84,7 @@ class OnlineEagle3Model(Eagle3Model):
             self.sp_world_size = self.sp_ring_degree * self.sp_ulysses_degree
             self.sp_rank = torch.distributed.get_rank() % self.sp_world_size
 
-    @torch.compile()
+    @torch.compile(dynamic=True)
     def prepare_usp_input(self, full_input):
         shared_input = self.extract_func(
             full_input,
@@ -116,25 +117,23 @@ class OnlineEagle3Model(Eagle3Model):
             position_ids: (batch, seq_len)
         """
         # Step 1: handle vocab size
-        target_p_padded, position_mask = _compute_target_p_padded(
+        target_p, position_mask = _compute_target_p(
             target=target,
             t2d=self.draft_model.t2d,
             loss_mask=loss_mask,
-            length=self.length,
         )
+        from .forkedpdb import ForkedPdb
+        # ForkedPdb().set_trace()
         del target
         torch.cuda.empty_cache()
 
         # basic info
         batch_size, seq_length, _ = hidden_states.shape
+        # global_seq_length = input_ids.shape[1]
         seq_length_with_past = seq_length
         past_key_values_length = 0
 
         # Step 2: project the concatenated hidden states to the target hidden size
-        if self.attention_backend == "usp":
-            # NOTE: Split first for USP to parallelize computation and ensure
-            # gradient consistency without redundant full-sequence projection.
-            hidden_states = self.prepare_usp_input(hidden_states)
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
 
         # Step 3: process kv cache, position ids and position ids
@@ -150,14 +149,23 @@ class OnlineEagle3Model(Eagle3Model):
                 )
                 position_ids = mrope_positions_ids
             else:
-                device = hidden_states.device
-                position_ids = torch.arange(
-                    past_key_values_length,
-                    seq_length + past_key_values_length,
-                    dtype=torch.long,
-                    device=device,
-                )
-                position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+                if self.attention_backend == "usp":
+                    position_ids = torch.arange(
+                        past_key_values_length,
+                        past_key_values_length + hidden_states.shape[1] * self.sp_world_size,
+                        dtype=torch.long,
+                        device=hidden_states.device,
+                    ).unsqueeze(0)
+
+                    # print("position ids 形状为:",position_ids.shape, sp_rank, current_shard_len, past_key_values_length)
+                else:
+                    position_ids = torch.arange(
+                        past_key_values_length,
+                        seq_length + past_key_values_length,
+                        dtype=torch.long,
+                        device=input_ids.device,
+                    )
+                    position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
 
@@ -177,30 +185,68 @@ class OnlineEagle3Model(Eagle3Model):
                 past_key_values_length=past_key_values_length,
             )
 
+        # def compute_loss_and_acc_checkpointed(hs, tgt_p, pos_mask, l_mask):
+        #     # 1. Compute Logits(The part that consumes the most VRAM.)
+        #     logits_ = self.draft_model.compute_logits(hs)
+        #     logits = gather_outputs_and_unpad(logits_, gather_dim=1)
+
+        #     # 2. Compute Loss
+        #     loss_val = LogSoftmaxLoss.apply(logits, tgt_p, pos_mask)
+
+        #     # 3. Compute Accuracy
+        #     with torch.no_grad():
+        #         acc_val = _compute_metric_acc(
+        #             logits=logits,
+        #             target_p=tgt_p,
+        #             position_mask=pos_mask,
+        #             loss_mask=l_mask,
+        #         )
+        #     return loss_val, acc_val
+
         def compute_loss_and_acc_checkpointed(hs, tgt_p, pos_mask, l_mask):
-            # 1. Compute Logits(The part that consumes the most VRAM.)
-            logits_ = self.draft_model.compute_logits(hs)
-            logits = gather_outputs_and_unpad(logits_, gather_dim=1)
-
-            # 2. Compute Loss
+            # 1. Logits [B, 64k, V]
+            logits = self.draft_model.compute_logits(hs)
+            
+            # 2. Loss 计算 (Scalar Mean)
+            # 你的 LogSoftmaxLoss.apply 内部应该就是你提供的 _compute_loss 逻辑
+            # 它返回的是局部平均值：Sum / (Batch * 64k)
             loss_val = LogSoftmaxLoss.apply(logits, tgt_p, pos_mask)
-
-            # 3. Compute Accuracy
+            
+            # --- 关键修正：还原 Loss Sum ---
+            # 获取当前分片的总 Token 数 (包括 padding)
+            local_total_tokens = logits.shape[0] * logits.shape[1] 
+            # 还原出 Sum
+            local_loss_sum = loss_val * local_total_tokens
+            
+            # 3. Acc 计算
             with torch.no_grad():
-                acc_val = _compute_metric_acc(
-                    logits=logits,
-                    target_p=tgt_p,
-                    position_mask=pos_mask,
-                    loss_mask=l_mask,
-                )
-            return loss_val, acc_val
+                pred_ids = logits.argmax(dim=-1)
+                tgt_ids = tgt_p.argmax(dim=-1)
+                valid_mask = (l_mask > 0.5)
+                
+                # 分子：预测正确的个数
+                local_correct_sum = ((pred_ids == tgt_ids) * valid_mask).sum()
+                
+                # 分母：有效 Token 的个数 (注意：这里和 Loss 的分母不一样！)
+                local_valid_sum = valid_mask.sum()
+                
+            # 返回三个 Sum 用于 Reduce
+            # 1. Loss 的分子 (Sum of Loss)
+            # 2. Acc 的分子 (Correct Count)
+            # 3. Acc 的分母 (Valid Token Count)
+            # 4. Loss 的分母 (Total Token Count, 可选，如果 SP 切分均匀其实是常量)
+            return local_loss_sum, local_correct_sum, local_valid_sum, local_total_tokens
+
 
         # Step 5: run TTT
         plosses = []
         vlosses = []
         acces = []
+
         # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
-        global_input_ids = input_ids
+        # global_input_ids = input_ids
+        cur_input_ids = input_ids
+        cur_target_p = target_p
         if self.attention_backend in ["sdpa", "fa", "usp"]:
             cache_hidden = [[], []]
             past_key_values = None
@@ -211,11 +257,18 @@ class OnlineEagle3Model(Eagle3Model):
             raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
         for idx in range(self.length):
-            target_p = target_p_padded[:, idx : idx + seq_length, :]
-            if self.attention_backend == "usp":
-                input_ids = self.prepare_usp_input(global_input_ids)
-            else:
-                input_ids = global_input_ids
+            from .forkedpdb import ForkedPdb
+            # ForkedPdb().set_trace()
+
+            # if self.attention_backend == "usp":
+            #     target_slice_len = global_seq_length
+            # else:
+            #     target_slice_len = seq_length
+            # target_p = target_p_padded[:, idx : idx + target_slice_len, :]
+            # if self.attention_backend == "usp":
+            #     input_ids = self.prepare_usp_input(global_input_ids)
+            # else:
+            #     input_ids = global_input_ids
 
             is_last = idx == self.length - 1
 
@@ -238,27 +291,51 @@ class OnlineEagle3Model(Eagle3Model):
             hidden_states = hidden_states_out
 
             if hidden_states.requires_grad:
-                loss, acc = checkpoint(
+                from .forkedpdb import ForkedPdb
+                # ForkedPdb().set_trace()
+                loss_sum, acc_correct_count, acc_valid_token_count, total_token_count = checkpoint(
                     compute_loss_and_acc_checkpointed,
                     hidden_states,
-                    target_p,
+                    cur_target_p,
                     position_mask,
                     loss_mask,
                     use_reentrant=False,
                 )
             else:
-                loss, acc = compute_loss_and_acc_checkpointed(
-                    hidden_states, target_p, position_mask, loss_mask
+                loss_sum, acc_correct_count, acc_valid_token_count, total_token_count = compute_loss_and_acc_checkpointed(
+                    hidden_states, cur_target_p, position_mask, loss_mask
                 )
+            
+            if dist.is_initialized():
+                # 关键：detach loss_sum，只用来计算数值
+                with torch.no_grad():
+                    m = torch.stack([loss_sum.detach(), acc_correct_count, acc_valid_token_count, torch.tensor(total_token_count, device=loss_sum.device)])
+                    dist.all_reduce(m, op=dist.ReduceOp.SUM, group=get_draft_sp_group())
+                    g_loss_sum, g_correct, g_valid, g_total = m[0], m[1], m[2], m[3]
+                    
+                # 用于 backward 的 loss (带有梯度)
+                # 只有这一步会把梯度传回本地 hidden_states
+                loss = loss_sum / g_total 
+                from .forkedpdb import ForkedPdb
+                ForkedPdb().set_trace()
+                # 用于返回和显示的全局指标
+                display_loss = g_loss_sum / g_total
+                display_acc = g_correct / (g_valid + 1e-8)
+            else:
+                loss = loss_sum / total_token_count
+                display_loss = loss
+                display_acc = acc_correct_count / acc_valid_token_count
 
-            plosses.append(loss)
-            acces.append(acc)
+            plosses.append(loss) # 如果后面要调用 .backward()，这里必须放 loss,display_loss 是显示的标量
+            acces.append(display_acc)
             if not is_last:
                 # Step 5.7: we need to update the loss mask
-                global_input_ids = padding(global_input_ids, left=False)
-                position_mask = padding(position_mask, left=False)
-                loss_mask = padding(loss_mask, left=False)
+                # global_input_ids = sp_padding(global_input_ids, left=False)
+                cur_input_ids = sp_padding(cur_input_ids, left=False)
+                position_mask = sp_padding(position_mask, left=False)
+                loss_mask = sp_padding(loss_mask, left=False)
                 # Flex attention mask shirnking is handled inside attention module
+                cur_target_p = sp_padding(cur_target_p, left=False, padding_value=1.0/cur_target_p.shape[-1])
         return plosses, vlosses, acces
 
 
@@ -575,7 +652,7 @@ def _compute_target_p_padded(target, t2d, loss_mask, length):
         return target_p_padded, position_mask
 
 
-@torch.compile(dynamic=None)
+# @torch.compile(dynamic=None)
 def _compute_target_p(target, t2d, loss_mask):
     target_head = target
     target_max_token = target_head.argmax(-1)

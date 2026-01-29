@@ -357,3 +357,92 @@ def safe_conversations_generator(file_path):
             except Exception as e:
                 logger.warning(f"Skipping line {i + 1}: {e}")
                 continue
+
+
+
+def sp_padding(tensor, left=True, padding_value=0):
+    """
+    SP 版本的 padding 操作。
+    left=False (Shift Left): 全局数据向左移。[R0, R1] -> [R0_shift, R1_shift]。
+                             Rank 0 的末尾不再补 0，而是补 Rank 1 的头部数据。
+                             Rank Last 的末尾补 0 (和原始逻辑一致)。
+    """
+    from specforge.distributed import get_draft_sp_group
+    # 1. 单卡模式 fallback (完全复用你的原始逻辑)
+    if get_draft_sp_group() is None or dist.get_world_size(get_draft_sp_group()) <= 1:
+        zeropadding = torch.full_like(tensor[:, -1:], padding_value)
+        if left:
+            return torch.cat((zeropadding, tensor[:, :-1]), dim=1)
+        else:
+            return torch.cat((tensor[:, 1:], zeropadding), dim=1)
+
+    # 2. 分布式模式
+    rank = dist.get_rank(get_draft_sp_group())
+    world_size = dist.get_world_size(get_draft_sp_group())
+    
+    # 原始逻辑生成本地的 padded 版本 (这部分作为基础)
+    # 本地移位：Rank 0: [1, 2, 3] -> [2, 3, 0_local]
+    zeropadding = torch.full_like(tensor[:, -1:], padding_value)
+    if left:
+        shifted_tensor = torch.cat((zeropadding, tensor[:, :-1]), dim=1)
+    else:
+        shifted_tensor = torch.cat((tensor[:, 1:], zeropadding), dim=1)
+
+    # 3. 处理跨卡边界 (覆盖掉本地补的那个 0)
+    # 注意：shifted_tensor 的 shape 和 input tensor 一致
+    
+    ops = []
+    
+    if not left: 
+        # === Case: left=False (Loop中常用的向左移) ===
+        # 数据流向：Rank i+1 的头部 -> Rank i 的尾部
+        
+        # 接收操作：如果我不是最后一个 Rank，我需要从右边(Next Rank)接收数据填补我的尾部
+        if rank < world_size - 1:
+            # 准备接收 buffer，大小等于 tensor[:, -1:]
+            recv_buff = torch.empty_like(zeropadding) 
+            next_rank = rank + 1
+            ops.append(dist.P2POp(dist.irecv, recv_buff, peer=next_rank, group=get_draft_sp_group()))
+        
+        # 发送操作：如果我不是第一个 Rank，我需要把我的头部(原始数据的第一个)发送给左边(Prev Rank)
+        if rank > 0:
+            # 注意：要发送的是原始 tensor 的第一位，不是 shift 后的
+            send_buff = tensor[:, 0:1].clone() 
+            prev_rank = rank - 1
+            ops.append(dist.P2POp(dist.isend, send_buff, peer=prev_rank, group=get_draft_sp_group()))
+            
+        # 执行通信
+        if ops:
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+                
+        # 修正数据：如果我接收到了数据，用它替换掉本地 padding 的 0
+        if rank < world_size - 1:
+            shifted_tensor[:, -1:] = recv_buff
+            
+    else:
+        # === Case: left=True (向右移) ===
+        # 数据流向：Rank i-1 的尾部 -> Rank i 的头部
+        
+        # 接收操作：如果我不是 Rank 0，我需要从左边接收数据填补我的头部
+        if rank > 0:
+            recv_buff = torch.empty_like(zeropadding)
+            prev_rank = rank - 1
+            ops.append(dist.P2POp(dist.irecv, recv_buff, peer=prev_rank, group=get_draft_sp_group()))
+            
+        # 发送操作：如果我不是最后一个 Rank，把我的尾部发给右边
+        if rank < world_size - 1:
+            send_buff = tensor[:, -1:].clone()
+            next_rank = rank + 1
+            ops.append(dist.P2POp(dist.isend, send_buff, peer=next_rank, group=get_draft_sp_group()))
+            
+        if ops:
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+                
+        if rank > 0:
+            shifted_tensor[:, 0:1] = recv_buff
+
+    return shifted_tensor
