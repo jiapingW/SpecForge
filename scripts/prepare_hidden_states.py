@@ -577,15 +577,30 @@ def main():
     assert os.path.exists(
         args.data_path
     ), f"Dataset path {args.data_path} does not exist"
-    dataset = Dataset.from_generator(
-        generator=safe_conversations_generator,
-        gen_kwargs={"file_path": args.data_path},
-        cache_dir=os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "cache",
-            "hf_dataset",
-        ),
+
+    shared_dataset_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "cache",
+        "hf_dataset_shared",  # 建议换个名字，避免混淆
     )
+    if dist.get_rank() == 0:
+        print_with_rank("Generating and saving dataset...")
+        dataset = Dataset.from_generator(
+            generator=safe_conversations_generator,
+            gen_kwargs={"file_path": args.data_path},
+            cache_dir=os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "cache",
+                "hf_dataset",
+            ),
+        )
+        dataset.save_to_disk(shared_dataset_path)
+        print_with_rank(f"Dataset saved to {shared_dataset_path}")
+    dist.barrier()
+
+    print_with_rank("Loading dataset from disk...")
+    dataset = load_from_disk(shared_dataset_path)
+
     if args.num_samples is not None:
         dataset = dataset.select(range(args.num_samples))
     # Tokenizer and cache key
